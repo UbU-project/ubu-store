@@ -1,0 +1,16 @@
+[package]
+name = "ubu_store"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Async SQLite canonical state and admission layer for UbU Phase 1."
+repository = "https://github.com/UbU-project/ubu-store"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
+thiserror = "1.0"
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+ubu_core = { git = "https://github.com/UbU-project/ubu-core", rev = "1cc00650b25924ba705eab5ad1730d99304741f2" }

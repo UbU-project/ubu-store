@@ -1,0 +1,12 @@
+name: Contract change
+description: Propose a change to the store contract.
+title: "[contract] "
+labels: ["contract"]
+body:
+  - type: textarea
+    id: change
+    attributes:
+      label: Change
+      description: Describe the contract change and migration impact.
+    validations:
+      required: true

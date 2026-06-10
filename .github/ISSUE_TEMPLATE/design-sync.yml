@@ -1,0 +1,12 @@
+name: Design sync
+description: Capture a design discussion for UbU store behavior.
+title: "[design] "
+labels: ["design"]
+body:
+  - type: textarea
+    id: topic
+    attributes:
+      label: Topic
+      description: What needs design alignment?
+    validations:
+      required: true
