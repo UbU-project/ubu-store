@@ -15,8 +15,8 @@ async fn queries_recalculation_triggers() {
             object_refs: json!([]),
             payload: json!({"reason": "test"}),
             provenance: json!({
-                "createdAt": "2026-06-10T14:30:00Z",
-                "authoritySource": "system"
+                "created_at": "2026-06-10T14:30:00Z",
+                "authority_source": "system"
             }),
             created_at: "2026-06-10T14:30:00Z".to_owned(),
         },

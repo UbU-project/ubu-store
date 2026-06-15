@@ -17,8 +17,8 @@ async fn appends_log_entry() {
             object_refs: json!([object_id]),
             payload: json!({"ok": true}),
             provenance: json!({
-                "createdAt": "2026-06-10T14:30:00Z",
-                "authoritySource": "user"
+                "created_at": "2026-06-10T14:30:00Z",
+                "authority_source": "user"
             }),
             created_at: "2026-06-10T14:30:00Z".to_owned(),
         },

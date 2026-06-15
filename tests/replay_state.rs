@@ -16,8 +16,8 @@ async fn replays_object_history_from_logs() {
             object_refs: json!([object_id.clone()]),
             payload: json!({"version": 1}),
             provenance: json!({
-                "createdAt": "2026-06-10T14:30:00Z",
-                "authoritySource": "user"
+                "created_at": "2026-06-10T14:30:00Z",
+                "authority_source": "user"
             }),
             created_at: "2026-06-10T14:30:00Z".to_owned(),
         },
