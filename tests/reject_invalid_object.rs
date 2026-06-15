@@ -28,22 +28,25 @@ async fn rejects_invalid_object_id() {
 #[tokio::test]
 async fn rejects_noncanonical_task_status() {
     let store = UbuStore::in_memory().await.expect("store initializes");
-    let result = queries::admit_object(
-        store.pool(),
-        NewObjectRecord {
-            id: UbuId::new(ObjectType::Task).to_string(),
-            object_type: "Task".to_owned(),
-            version: 1,
-            status: "ready".to_owned(),
-            compartment_label: "default".to_owned(),
-            payload: json!({"title": "bad status"}),
-            created_at: "2026-06-10T14:30:00Z".to_owned(),
-            updated_at: "2026-06-10T14:30:00Z".to_owned(),
-        },
-    )
-    .await;
+    for status in ["canceled", "ready", "in_progress", "proposed", "blocked"] {
+        let result = queries::admit_object(
+            store.pool(),
+            NewObjectRecord {
+                id: UbuId::new(ObjectType::Task).to_string(),
+                object_type: "Task".to_owned(),
+                version: 1,
+                status: status.to_owned(),
+                compartment_label: "default".to_owned(),
+                payload: json!({"title": "bad status"}),
+                created_at: "2026-06-10T14:30:00Z".to_owned(),
+                updated_at: "2026-06-10T14:30:00Z".to_owned(),
+            },
+        )
+        .await;
 
-    assert!(result.is_err());
+        let err = result.expect_err("noncanonical status rejected");
+        assert!(err.to_string().contains("UBU-D0227"));
+    }
 }
 
 #[tokio::test]
@@ -70,17 +73,24 @@ async fn rejects_moot_task_without_payload_reason() {
 #[tokio::test]
 async fn admits_moot_task_with_payload_reason() {
     let store = UbuStore::in_memory().await.expect("store initializes");
+    let task_id = UbuId::new(ObjectType::Task).to_string();
     let result = queries::admit_object(
         store.pool(),
         NewObjectRecord {
-            id: UbuId::new(ObjectType::Task).to_string(),
+            id: task_id.clone(),
             object_type: "Task".to_owned(),
             version: 1,
             status: "moot".to_owned(),
             compartment_label: "default".to_owned(),
             payload: json!({
+                "id": task_id,
                 "title": "has moot reason",
-                "moot_reason_code": "duplicate"
+                "status": "moot",
+                "moot_reason_code": "duplicate",
+                "provenance": {
+                    "created_at": "2026-06-10T14:30:00Z",
+                    "authority_source": "user"
+                }
             }),
             created_at: "2026-06-10T14:30:00Z".to_owned(),
             updated_at: "2026-06-10T14:30:00Z".to_owned(),

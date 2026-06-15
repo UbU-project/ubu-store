@@ -20,6 +20,7 @@ use crate::models::projection_record::{
     ProjectionResultRecord,
 };
 use crate::models::worker_submission_record::{NewWorkerSubmissionRecord, WorkerSubmissionRecord};
+use crate::recalculation::validate_recalculation_trigger_payload;
 
 pub async fn admit_object(pool: &SqlitePool, record: NewObjectRecord) -> Result<ObjectRecord> {
     validate_object_record(&record)?;
@@ -68,6 +69,9 @@ pub async fn admit_candidate_object(
 pub async fn append_log_entry(pool: &SqlitePool, record: NewLogRecord) -> Result<LogRecord> {
     validate_object_id_for_type(&record.id, ObjectType::LogEntry.as_str())?;
     validate_provenance_json(&record.provenance)?;
+    if record.event_type == "recalculation_requested" {
+        validate_recalculation_trigger_payload(&record.payload)?;
+    }
     UbuTimestamp::parse(&record.created_at)?;
     let object_refs_json = serde_json::to_string(&record.object_refs)?;
     let payload_json = serde_json::to_string(&record.payload)?;

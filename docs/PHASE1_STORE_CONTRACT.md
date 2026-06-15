@@ -16,6 +16,12 @@ Phase 1 must preserve stable prefixed UUIDv7 object IDs, schema versions, object
 
 Phase 1 does not implement multi-device replication, CRDT merging, encrypted per-Compartment SQLite files, remote wipe, or transport protocols. Those are Phase 2 concerns. Phase 1 only preserves the local invariants necessary for those mechanisms to be added later.
 
+Relevant schema and contract decisions:
+
+- `UBU-D0227`: persisted `Task.status` is canonical lifecycle only.
+- `UBU-D0229`: Phase 1 admits Preference, Container, UniverseState, Identity, Relationship, and ExternalEvent IDs in the canonical registry.
+- `UBU-D0230`: compartment-boundary decisions are represented as provenance-bearing log evidence.
+
 ## Canonical admission boundary
 
 `ubu-store` is the only Phase 1 component allowed to mutate canonical local state directly.
@@ -32,6 +38,30 @@ Other repos may submit records for admission, including:
 - logs.
 
 Those submissions do not become canonical state until admitted by `ubu-store` according to the applicable schema, provenance, authority, Compartment, and validation rules.
+
+The Phase 1 canonical state object categories admitted by the store are:
+
+```text
+Task
+Objective
+Plan
+ExternalReference
+Compartment
+Snapshot
+AutomationWorker
+ProjectionPreview
+Calendar
+Preference
+Container
+UniverseState
+Identity
+Relationship
+ExternalEvent
+```
+
+`LogEntry` is also a registered UbU object type and store evidence record, but append-only log insertion is handled through the log API rather than counted as one of the fifteen canonical state object categories above.
+
+Admitted canonical object envelopes must carry a stable prefixed UUIDv7 ID, an object type matching that ID prefix, a positive object version, required provenance or authority metadata, and required logical Compartment metadata.
 
 ## SQLite is not the replication contract
 
@@ -85,6 +115,12 @@ snap_
 worker_
 proj_
 cal_
+pref_
+container_
+ustate_
+identity_
+rel_
+xevent_
 ```
 
 SQLite internal row IDs, if any, must not be exposed as canonical UbU object IDs.
@@ -124,6 +160,21 @@ system
 
 The store should not treat `policy` or `system` as autonomous user-equivalent authorities. They are implementation/enforcement sources whose admissibility remains constrained by UbU's user-sovereignty, Compartment, and provenance rules.
 
+## Task lifecycle status
+
+Per `UBU-D0227`, persisted `Task.status` is limited to canonical lifecycle values:
+
+```text
+active
+completed
+failed
+moot
+```
+
+Readiness and execution states are derived views and must not be persisted as canonical `Task.status`. The store rejects `ready`, `in_progress`, `proposed`, `blocked`, and `canceled` with a diagnostic naming `UBU-D0227`.
+
+A `moot` task must carry `moot_reason_code` in the task payload JSON. Non-moot lifecycle states must not carry `moot_reason_code`.
+
 ## Logical Compartment metadata
 
 Phase 1 stores Compartment labels and policy summaries as logical metadata.
@@ -151,6 +202,24 @@ They may submit:
 `ubu-store` admits or rejects those submissions according to the store contract and relevant schema contracts.
 
 GitHub remains an external projection/source, not the canonical UbU state store.
+
+## Recalculation triggers
+
+Recalculation requests use a closed `TriggerType` vocabulary rather than free-form reasons. Accepted trigger values are:
+
+```text
+task_completed
+task_failed
+task_moot
+user_override
+observed_snapshot
+external_event
+github_update
+low_compact_calendar_coverage
+worker_request
+```
+
+Optional explanatory text belongs in `note`. Payloads with a free-form `reason` field are rejected.
 
 ## Phase 1 non-goals
 

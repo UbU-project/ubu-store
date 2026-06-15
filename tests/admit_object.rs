@@ -17,7 +17,15 @@ async fn admits_valid_task_object() {
             version: 1,
             status: "active".to_owned(),
             compartment_label: "default".to_owned(),
-            payload: json!({"title": "ship scaffold"}),
+            payload: json!({
+                "id": id,
+                "title": "ship scaffold",
+                "status": "active",
+                "provenance": {
+                    "created_at": "2026-06-10T14:30:00Z",
+                    "authority_source": "user"
+                }
+            }),
             created_at: now.clone(),
             updated_at: now,
         },
