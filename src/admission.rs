@@ -1,4 +1,6 @@
-use serde_json::Value;
+use std::collections::HashSet;
+
+use serde_json::{Map, Value};
 use ubu_core::core::TaskStatus;
 use ubu_core::id_registry::ObjectType;
 use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
@@ -6,6 +8,7 @@ use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
 use crate::compartment_gate::validate_compartment_label;
 use crate::errors::{Result, StoreError};
 use crate::models::object_record::NewObjectRecord;
+use crate::models::task_record::{TaskCorrelationGroup, TaskDurationEstimate};
 use crate::provenance_gate::validate_provenance_value;
 
 pub fn object_type_from_str(value: &str) -> Result<ObjectType> {
@@ -112,9 +115,43 @@ fn validate_canonical_object_payload(record: &NewObjectRecord) -> Result<()> {
 
     let object_type = object_type_from_str(&record.object_type)?;
     validate_payload_lifecycle_status(record, payload)?;
+    validate_task_estimate_fields(object_type, payload)?;
     validate_payload_provenance(object_type, payload)?;
     validate_payload_authority_source(object_type, payload)?;
     validate_payload_compartment_metadata(object_type, payload)?;
+
+    Ok(())
+}
+
+fn validate_task_estimate_fields(
+    object_type: ObjectType,
+    payload: &Map<String, Value>,
+) -> Result<()> {
+    if object_type != ObjectType::Task {
+        return Ok(());
+    }
+
+    if let Some(value) = payload.get("duration_estimate") {
+        let estimate: TaskDurationEstimate = serde_json::from_value(value.clone())?;
+        estimate.validate()?;
+    }
+
+    if let Some(value) = payload.get("correlation_groups") {
+        let groups: Vec<TaskCorrelationGroup> = serde_json::from_value(value.clone())?;
+        let mut names = HashSet::with_capacity(groups.len());
+        for group in groups {
+            if !(0.0..=1.0).contains(&group.strength) {
+                return Err(invalid_payload(
+                    "core/task schema: correlation group strength must be between zero and one",
+                ));
+            }
+            if !names.insert(group.group) {
+                return Err(invalid_payload(
+                    "core/task schema: correlation group names must be unique",
+                ));
+            }
+        }
+    }
 
     Ok(())
 }
