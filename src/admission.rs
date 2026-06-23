@@ -184,7 +184,10 @@ fn validate_payload_provenance(
 
     if matches!(
         object_type,
-        ObjectType::Task | ObjectType::Objective | ObjectType::ExternalReference
+        ObjectType::Task
+            | ObjectType::Objective
+            | ObjectType::ExternalReference
+            | ObjectType::UniverseState
     ) && provenance.is_none()
     {
         return Err(invalid_payload(
