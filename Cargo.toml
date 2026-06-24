@@ -13,4 +13,4 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate
 thiserror = "1.0"
 tokio = { version = "1.38", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
-ubu_core = { git = "https://github.com/UbU-project/ubu-core", rev = "4b1e06cd440bea638b91ad89cbea85b9341eba5c" }
+ubu_core = { git = "https://github.com/UbU-project/ubu-core", rev = "2444b76e8eed75040e5a5791d1dce2579f0fe006" }

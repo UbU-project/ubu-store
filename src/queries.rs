@@ -1,13 +1,15 @@
+use serde_json::Value;
 use sqlx::SqlitePool;
+use ubu_core::core::UniverseState;
 use ubu_core::id_registry::ObjectType;
 use ubu_core::store::CandidateObject;
-use ubu_core::{AuthoritySource, UbuId, UbuTimestamp};
+use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
 
 use crate::admission::{
     object_type_from_str, validate_object_id_for_type, validate_object_record,
     validate_provenance_json,
 };
-use crate::errors::Result;
+use crate::errors::{Result, StoreError};
 use crate::models::calendar_record::{CalendarRecord, NewCalendarRecord};
 use crate::models::external_reference_record::{
     ExternalReferenceRecord, NewExternalReferenceRecord,
@@ -105,6 +107,83 @@ pub async fn get_current_state(pool: &SqlitePool, id: &str) -> Result<Option<Obj
         .fetch_optional(pool)
         .await
         .map_err(Into::into)
+}
+
+/// Persist an updated [`UniverseState`] container as a new current version.
+///
+/// UniverseState is a single current-state object (UBU-D0241): after a Task's
+/// effects are applied elsewhere (by the orchestrator via the pure `ubu-core`
+/// applicator), the resulting container is persisted here as the new current
+/// version. This is a current-version update — not an append of mutation deltas;
+/// mutation history lives in Logs. The store owns UniverseState persistence, so
+/// callers never write SQL against it directly. Authorized by UBU-D0242.
+///
+/// The four collections (`facts`, `numeric_values`, `set_memberships`,
+/// `event_markers`) and the shell fields (`id`, `captured_at`, `source_summary`,
+/// `confidence_summary`) round-trip losslessly. The existing `schema_version`
+/// shell metadata is preserved, and the supplied [`Provenance::authority_source`]
+/// is carried on the persisted payload, consistent with the other canonical
+/// writes. Admission invariants (id-prefix, payload id match, provenance) are
+/// re-checked before the write.
+pub async fn persist_universe_state(
+    pool: &SqlitePool,
+    state: &UniverseState,
+    authority_source: AuthoritySource,
+) -> Result<ObjectRecord> {
+    let id = state.id.to_string();
+    let current = get_current_state(pool, &id).await?.ok_or_else(|| {
+        StoreError::InvalidPayload(format!(
+            "cannot persist UniverseState `{id}`: no current version exists"
+        ))
+    })?;
+
+    // Serialize the updated container; carry the schema_version and provenance
+    // shell metadata that live alongside the canonical UniverseState payload.
+    let mut payload = serde_json::to_value(state)?;
+    let current_payload: Value = serde_json::from_str(&current.payload_json)?;
+    if let Some(schema_version) = current_payload.get("schema_version") {
+        payload["schema_version"] = schema_version.clone();
+    }
+    let now = UbuTimestamp::now_utc();
+    payload["provenance"] = serde_json::to_value(Provenance {
+        created_at: now,
+        created_by: None,
+        authority_source,
+        source: None,
+        source_refs: None,
+    })?;
+
+    let now = now.to_string();
+    let record = NewObjectRecord {
+        id: id.clone(),
+        object_type: ObjectType::UniverseState.as_str().to_owned(),
+        version: current.version + 1,
+        status: current.status.clone(),
+        compartment_label: current.compartment_label.clone(),
+        payload,
+        created_at: current.created_at.clone(),
+        updated_at: now,
+    };
+    validate_object_record(&record)?;
+    let payload_json = serde_json::to_string(&record.payload)?;
+
+    sqlx::query(
+        "UPDATE objects
+        SET version = ?, status = ?, compartment_label = ?, payload_json = ?, updated_at = ?
+        WHERE id = ?",
+    )
+    .bind(record.version)
+    .bind(&record.status)
+    .bind(&record.compartment_label)
+    .bind(&payload_json)
+    .bind(&record.updated_at)
+    .bind(&record.id)
+    .execute(pool)
+    .await?;
+
+    Ok(get_current_state(pool, &id)
+        .await?
+        .expect("updated object is readable"))
 }
 
 pub async fn get_object_history(pool: &SqlitePool, object_id: &str) -> Result<Vec<LogRecord>> {
