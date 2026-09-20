@@ -107,7 +107,7 @@ pub(crate) async fn prepare_mutation(
     let key = envelope.mutation_key();
     let canonical_payload = String::from_utf8(canonical_payload_bytes(payload))
         .expect("canonical JSON bytes are UTF-8");
-    let replay = get_recorded_mutation(&mut *connection, &key).await?;
+    let replay = lookup_mutation(&mut *connection, &key).await?;
     if let Some(recorded) = &replay {
         if recorded.canonical_payload != canonical_payload {
             return Err(ubu_core::UbuError::IdempotencyKeyConflict {
@@ -381,8 +381,19 @@ pub async fn append_log_entry(
     finish_mutation(transaction, result).await
 }
 
-/// Look up an admission audit row by its complete device-scoped duplicate key.
+/// Canonical admission audit view. Candidate-only requests contain review data
+/// and are excluded; the private replay lookup still sees all Device-global keys.
 pub async fn get_recorded_mutation<'e, E>(
+    executor: E,
+    key: &MutationKey,
+) -> Result<Option<RecordedMutation>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(lookup_mutation(executor, key).await?.filter(|row| row.result_version >= 0))
+}
+
+async fn lookup_mutation<'e, E>(
     executor: E,
     key: &MutationKey,
 ) -> Result<Option<RecordedMutation>>

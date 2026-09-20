@@ -60,8 +60,12 @@ rg -n 'SELECT|JOIN' src/queries.rs src/replay.rs src/recalculation.rs src/api
   return CandidateRecord. `get_current_state` returns None for a valid candidate
   id, which is intentionally not a canonical UbuId. Invalid unrelated ids still
   fail the existing parser. Canonical admission cannot accept an advcand_ id.
-- Candidate and event payloads preserve Compartment labels and refs. This ticket
-  deliberately provides no Compartment filtering or policy enforcement.
+  The canonical `get_recorded_mutation` view also excludes candidate-only ledger
+  payloads (negative result versions); private `lookup_mutation` retains the full
+  Device-global ledger for replay and cross-writer conflict detection.
+- Candidate payloads preserve Compartment labels and refs; event envelopes retain
+  supplied policy observations. This ticket deliberately provides no Compartment
+  filtering or policy enforcement.
 
 ## Literal readings and representation choices
 

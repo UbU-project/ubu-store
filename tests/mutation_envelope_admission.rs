@@ -1,9 +1,8 @@
 mod common;
 
 use serde_json::{json, Value};
-use ubu_core::store::CandidateObject;
 use ubu_core::{
-    canonical_payload_bytes, AuthoritySource, DeviceId, MutationEnvelope, ObjectType, UbuError,
+    canonical_payload_bytes, DeviceId, MutationEnvelope, ObjectType, UbuError,
     UbuId, UbuTimestamp, VersionRef,
 };
 use ubu_store::models::object_record::{NewObjectRecord, ObjectRecord};
@@ -466,34 +465,21 @@ async fn sqlite_version_exhaustion_rolls_back() {
 }
 
 #[tokio::test]
-async fn candidate_still_writes_active_canonical_row_without_envelope() {
+async fn candidate_storage_does_not_create_active_canonical_rows() {
     let store = UbuStore::in_memory().await.unwrap();
     let record = task();
-    let candidate = CandidateObject {
-        candidate_id: record.id.clone(),
-        object_type: record.object_type,
-        payload: record.payload.clone(),
-        submitted_at: UbuTimestamp::parse(&record.created_at).unwrap(),
-        authority_source: AuthoritySource::User,
-    };
-    let admitted = queries::admit_candidate_object(store.pool(), candidate, "default")
-        .await
-        .unwrap();
-    assert_eq!(admitted.version, 1);
-    assert_eq!(admitted.status, "active");
-    assert_eq!(
-        serde_json::from_str::<Value>(&admitted.payload_json).unwrap(),
-        record.payload
-    );
-    assert_eq!(
-        queries::get_current_state(store.pool(), &record.id)
-            .await
-            .unwrap(),
-        Some(admitted.clone())
-    );
-    assert!(queries::query_active_tasks(store.pool())
-        .await
-        .unwrap()
-        .contains(&admitted));
-    assert_eq!(envelope_count(&store).await, 0);
+    let candidate = common::candidate_for(&record);
+    let id = candidate.advisory_candidate_id.clone();
+    let stored = ubu_store::api::admission::store_advisory_candidate(
+        store.pool(), &common::append_envelope(), candidate.clone(),
+    ).await.unwrap();
+    assert_eq!(stored.version, 1);
+    assert_eq!(stored.lifecycle_state, "proposed");
+    assert_eq!(stored.candidate().unwrap(), candidate);
+    // This assertion would have failed before P1B-5: the legacy writer put
+    // proposals into objects as active canonical rows without envelopes.
+    assert!(queries::get_current_state(store.pool(), &record.id).await.unwrap().is_none());
+    assert!(queries::get_current_state(store.pool(), id.as_str()).await.unwrap().is_none());
+    assert!(queries::query_active_tasks(store.pool()).await.unwrap().is_empty());
+    assert_eq!(envelope_count(&store).await, 1);
 }

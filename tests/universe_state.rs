@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 use ubu_core::core::{JsonScalar, UniverseState};
 use ubu_core::id_registry::ObjectType;
-use ubu_core::store::CandidateObject;
 use ubu_core::{AuthoritySource, UbuId, UbuTimestamp};
 use ubu_store::models::object_record::NewObjectRecord;
 use ubu_store::{queries, UbuStore};
@@ -52,24 +51,26 @@ async fn admits_universe_state_and_round_trips_all_collections() {
 }
 
 #[tokio::test]
-async fn admits_universe_state_candidate_with_provenance_authority_source() {
+async fn admits_universe_state_with_envelope_and_provenance_authority_source() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let state = populated_universe_state();
     let payload = universe_state_payload(&state);
 
-    let admitted = queries::admit_candidate_object(
+    let admitted = common::admit_object(
         store.pool(),
-        CandidateObject {
-            candidate_id: state.id.to_string(),
+        NewObjectRecord {
+            id: state.id.to_string(),
             object_type: ObjectType::UniverseState.as_str().to_owned(),
+            version: 1,
+            status: "active".to_owned(),
+            compartment_label: "default".to_owned(),
             payload: payload.clone(),
-            submitted_at: UbuTimestamp::parse("2026-06-22T13:00:00Z").expect("valid submitted_at"),
-            authority_source: AuthoritySource::User,
+            created_at: "2026-06-22T13:00:00Z".to_owned(),
+            updated_at: "2026-06-22T13:00:00Z".to_owned(),
         },
-        "default",
     )
     .await
-    .expect("candidate admitted");
+    .expect("canonical state admitted with envelope");
 
     let stored_payload: Value =
         serde_json::from_str(&admitted.payload_json).expect("stored payload is json");
