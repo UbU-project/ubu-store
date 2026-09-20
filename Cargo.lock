@@ -1604,7 +1604,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "ubu_core"
 version = "0.1.0"
-source = "git+https://github.com/UbU-project/ubu-core?rev=fa78564#fa7856451061006f3e50a3e0bd1231a200389869"
+source = "git+https://github.com/UbU-project/ubu-core?rev=db37776#db37776f7d364f3a3c8efd694aa34e253334c3a9"
 dependencies = [
  "regex",
  "serde",
