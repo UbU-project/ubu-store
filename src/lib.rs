@@ -1,3 +1,4 @@
+pub mod candidates;
 pub mod admission;
 pub mod api;
 pub mod compartment_gate;

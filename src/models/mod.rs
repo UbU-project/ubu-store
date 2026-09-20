@@ -1,3 +1,4 @@
+pub mod candidate_record;
 pub mod calendar_record;
 pub mod external_reference_record;
 pub mod log_record;

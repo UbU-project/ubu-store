@@ -4,6 +4,8 @@ use sqlx::FromRow;
 /// Audit row for an admitted mutation. `result_version` records the admitted
 /// version, while replay reads the object's current state rather than a snapshot.
 /// Zero denotes an unversioned append-only log or external-reference result.
+/// Negative values denote candidate-state versions, negated to keep them separate
+/// from canonical object results. Candidate admission records the canonical result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
 pub struct RecordedMutation {
     pub origin_device_id: String,

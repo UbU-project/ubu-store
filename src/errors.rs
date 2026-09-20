@@ -4,6 +4,18 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("advisory candidate `{id}` does not exist")]
+    CandidateMissing { id: String },
+
+    #[error("candidate must initially be Proposed, got {state:?}")]
+    InvalidInitialCandidateState { state: ubu_core::CandidateLifecycleState },
+
+    #[error("transition to {state:?} requires its dedicated candidate writer")]
+    DedicatedCandidateWriterRequired { state: ubu_core::CandidateLifecycleState },
+
+    #[error("suppression record does not match candidate and decision provenance")]
+    SuppressionMismatch,
+
     #[error("precondition failed for `{object_id}`: expected {expected}, actual {actual}")]
     PreconditionFailed {
         object_id: String,

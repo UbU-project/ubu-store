@@ -47,12 +47,14 @@ use crate::recalculation::validate_recalculation_trigger_payload;
 
 /// The unchanged ledger has no table column. Positive result versions denote
 /// objects; zero denotes an unversioned append result, whose id identifies its
-/// log/xref kind. Keys remain global per Device, never scoped to this enum.
+/// log/xref kind. Negative versions denote candidate-state results (the negated
+/// candidate version). Keys remain global per Device, never scoped to this enum.
 #[derive(Clone, Copy)]
-enum MutationTarget {
+pub(crate) enum MutationTarget {
     Object,
     Log,
     ExternalReference,
+    Candidate,
 }
 
 impl MutationTarget {
@@ -61,12 +63,15 @@ impl MutationTarget {
             Self::Object => "objects",
             Self::Log => "logs",
             Self::ExternalReference => "external_references",
+            Self::Candidate => "advisory_candidates",
         }
     }
 
     fn accepts(self, recorded: &RecordedMutation) -> bool {
         match self {
             Self::Object => recorded.result_version > 0,
+            Self::Candidate => recorded.result_version < 0
+                && ubu_core::AdvisoryCandidateId::parse(&recorded.result_object_id).is_ok(),
             Self::Log | Self::ExternalReference => {
                 let expected = match self {
                     Self::Log => ObjectType::LogEntry,
@@ -81,15 +86,15 @@ impl MutationTarget {
     }
 }
 
-struct PreparedMutation {
-    canonical_payload: String,
-    replay: Option<RecordedMutation>,
+pub(crate) struct PreparedMutation {
+    pub(crate) canonical_payload: String,
+    pub(crate) replay: Option<RecordedMutation>,
 }
 
 /// Validate and check the shared device-scoped ledger before any preconditions.
 /// Payload equality is unchanged for admit_object and applies to record.payload
 /// for append-only writers. A same-payload key cannot switch result tables.
-async fn prepare_mutation(
+pub(crate) async fn prepare_mutation(
     connection: &mut SqliteConnection,
     envelope: &MutationEnvelope,
     payload: &Value,
@@ -153,7 +158,7 @@ async fn check_preconditions(
     Ok(())
 }
 
-async fn record_mutation(
+pub(crate) async fn record_mutation(
     connection: &mut SqliteConnection,
     envelope: &MutationEnvelope,
     canonical_payload: &str,
@@ -178,7 +183,7 @@ async fn record_mutation(
     Ok(())
 }
 
-async fn finish_mutation<T>(transaction: Transaction<'_, Sqlite>, result: Result<T>) -> Result<T> {
+pub(crate) async fn finish_mutation<T>(transaction: Transaction<'_, Sqlite>, result: Result<T>) -> Result<T> {
     match result {
         Ok(record) => {
             transaction.commit().await?;
@@ -282,22 +287,29 @@ pub async fn admit_object(
             MutationTarget::Object,
         )
         .await?;
-        if let Some(replay) = prepared.replay {
-            return read_object_result(&mut transaction, &replay.result_object_id).await;
-        }
-        let admitted = write_object_row(&mut transaction, envelope, record).await?;
-        record_mutation(
-            &mut transaction,
-            envelope,
-            &prepared.canonical_payload,
-            &admitted.id,
-            admitted.version,
-        )
-        .await?;
-        Ok(admitted)
+        admit_prepared_object(&mut transaction, envelope, record, prepared).await
     }
     .await;
     finish_mutation(transaction, result).await
+}
+
+/// Complete ordinary object admission on an already prepared transaction.
+/// Candidate admission composes this exact path with its candidate/event writes;
+/// only the outer public writer owns commit or rollback.
+pub(crate) async fn admit_prepared_object(
+    connection: &mut SqliteConnection,
+    envelope: &MutationEnvelope,
+    record: NewObjectRecord,
+    prepared: PreparedMutation,
+) -> Result<ObjectRecord> {
+    if let Some(replay) = prepared.replay {
+        return read_object_result(connection, &replay.result_object_id).await;
+    }
+    let admitted = write_object_row(connection, envelope, record).await?;
+    record_mutation(
+        connection, envelope, &prepared.canonical_payload, &admitted.id, admitted.version,
+    ).await?;
+    Ok(admitted)
 }
 
 /// UBU-D0274 violation retained solely for `admit_candidate_object`: candidate
