@@ -1,3 +1,21 @@
+//! State writer classification under UBU-D0258. Later tickets adding writers
+//! must extend this audit table and preserve the canonical envelope boundary.
+//!
+//! | Writer | State category | Envelope and reason |
+//! | --- | --- | --- |
+//! | `admit_object` | admitted canonical | Required: creates/updates canonical objects. |
+//! | `persist_universe_state` | admitted canonical | Required: bumps a canonical object's version. |
+//! | `append_log_entry` | admitted canonical | Required: records an append-only fact. |
+//! | `store_external_reference` | admitted canonical | Required: `xref_` is a registry object type. |
+//! | `store_plan`, `store_calendar` | `derived_state` | Exempt: derived artifacts, not canonical admission. |
+//! | `store_projection_preview`, `store_projection_result` | `projection_state` | Exempt: projection artifacts, not canonical admission. |
+//! | `store_worker_submission` | noncanonical submission | Exempt: submissions require admission before becoming canonical, per CONTRACT.md. |
+//! | `admit_candidate_object` | `candidate_state` (defective today) | Exempt: sole UBU-D0274 exception through a private writer; P1B-4 will separate candidate storage. |
+//!
+//! Exempt artifact storage does not authorize canonical recording, invalidation,
+//! or publication mutations without an envelope. Device-registry consultation
+//! and policy-version enforcement remain later work.
+
 use serde_json::Value;
 use sqlx::{Executor, Sqlite, SqlitePool};
 use ubu_core::core::UniverseState;
