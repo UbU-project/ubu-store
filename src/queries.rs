@@ -2,7 +2,9 @@ use serde_json::Value;
 use sqlx::{Executor, Sqlite, SqlitePool};
 use ubu_core::core::UniverseState;
 use ubu_core::id_registry::ObjectType;
-use ubu_core::store::{canonical_payload_bytes, CandidateObject, MutationEnvelope, VersionRef};
+use ubu_core::store::{
+    canonical_payload_bytes, CandidateObject, MutationEnvelope, MutationKey, VersionRef,
+};
 use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
 
 use crate::admission::{
@@ -21,6 +23,7 @@ use crate::models::projection_record::{
     NewProjectionPreviewRecord, NewProjectionResultRecord, ProjectionPreviewRecord,
     ProjectionResultRecord,
 };
+use crate::models::recorded_mutation::RecordedMutation;
 use crate::models::worker_submission_record::{NewWorkerSubmissionRecord, WorkerSubmissionRecord};
 use crate::recalculation::validate_recalculation_trigger_payload;
 
@@ -163,6 +166,37 @@ pub async fn admit_object(
     }
 }
 
+/// UBU-D0274 violation retained solely for `admit_candidate_object`: candidate
+/// proposals are still inserted into canonical `objects` as active version 1.
+/// P1B-4 will separate candidate_state. Do not use this writer for canonical mutations.
+async fn insert_object_row_without_envelope(
+    pool: &SqlitePool,
+    record: NewObjectRecord,
+) -> Result<ObjectRecord> {
+    validate_object_record(&record)?;
+    let payload_json = serde_json::to_string(&record.payload)?;
+
+    sqlx::query(
+        "INSERT INTO objects
+        (id, object_type, version, status, compartment_label, payload_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&record.id)
+    .bind(&record.object_type)
+    .bind(record.version)
+    .bind(&record.status)
+    .bind(&record.compartment_label)
+    .bind(&payload_json)
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(pool)
+    .await?;
+
+    Ok(get_current_state(pool, &record.id)
+        .await?
+        .expect("inserted object is readable"))
+}
+
 pub async fn admit_candidate_object(
     pool: &SqlitePool,
     candidate: CandidateObject,
@@ -179,7 +213,7 @@ pub async fn admit_candidate_object(
         created_at: now.clone(),
         updated_at: now,
     };
-    admit_object(pool, record).await
+    insert_object_row_without_envelope(pool, record).await
 }
 
 pub async fn append_log_entry(pool: &SqlitePool, record: NewLogRecord) -> Result<LogRecord> {
@@ -212,6 +246,21 @@ pub async fn append_log_entry(pool: &SqlitePool, record: NewLogRecord) -> Result
         .fetch_one(pool)
         .await
         .map_err(Into::into)
+}
+
+/// Look up an admission audit row by its complete device-scoped duplicate key.
+pub async fn get_recorded_mutation(
+    pool: &SqlitePool,
+    key: &MutationKey,
+) -> Result<Option<RecordedMutation>> {
+    sqlx::query_as::<_, RecordedMutation>(
+        "SELECT * FROM mutation_envelopes WHERE origin_device_id = ? AND idempotency_key = ?",
+    )
+    .bind(key.origin_device_id.as_str())
+    .bind(key.idempotency_key.as_str())
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn get_current_state<'e, E>(executor: E, id: &str) -> Result<Option<ObjectRecord>>
