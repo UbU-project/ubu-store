@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::json;
 use ubu_core::id_registry::ObjectType;
 use ubu_core::store::TriggerType;
@@ -10,6 +12,7 @@ async fn queries_recalculation_triggers() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     queries::append_log_entry(
         store.pool(),
+        &common::append_envelope(),
         NewLogRecord {
             id: UbuId::new(ObjectType::LogEntry).to_string(),
             event_type: "recalculation_requested".to_owned(),
@@ -41,6 +44,7 @@ async fn rejects_recalculation_trigger_with_free_form_reason() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let result = queries::append_log_entry(
         store.pool(),
+        &common::append_envelope(),
         NewLogRecord {
             id: UbuId::new(ObjectType::LogEntry).to_string(),
             event_type: "recalculation_requested".to_owned(),

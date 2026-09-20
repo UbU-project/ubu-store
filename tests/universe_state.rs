@@ -172,10 +172,14 @@ async fn persists_updated_universe_state_as_new_current_version() {
     );
     updated.confidence_summary = Some("updated confidence summary".to_owned());
 
-    let persisted =
-        queries::persist_universe_state(store.pool(), &updated, AuthoritySource::System)
-            .await
-            .expect("universe state persisted");
+    let persisted = queries::persist_universe_state(
+        store.pool(),
+        &common::envelope_for(state.id.as_str(), ubu_core::VersionRef::Version(1)),
+        &updated,
+        AuthoritySource::System,
+    )
+    .await
+    .expect("universe state persisted");
     assert_eq!(persisted.version, 2);
 
     let current = queries::get_current_state(store.pool(), &state.id.to_string())
@@ -213,8 +217,13 @@ async fn persist_universe_state_requires_existing_current_version() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let state = populated_universe_state();
 
-    let result =
-        queries::persist_universe_state(store.pool(), &state, AuthoritySource::System).await;
+    let result = queries::persist_universe_state(
+        store.pool(),
+        &common::envelope_for(state.id.as_str(), ubu_core::VersionRef::Version(1)),
+        &state,
+        AuthoritySource::System,
+    )
+    .await;
 
     assert!(result.is_err());
 }
@@ -267,4 +276,205 @@ fn universe_state_payload(state: &UniverseState) -> Value {
         "authority_source": "user"
     });
     payload
+}
+
+async fn seed_universe(
+    store: &UbuStore,
+    state: &UniverseState,
+) -> ubu_store::models::object_record::ObjectRecord {
+    common::admit_object(
+        store.pool(),
+        NewObjectRecord {
+            id: state.id.to_string(),
+            object_type: "UniverseState".into(),
+            version: 1,
+            status: "active".into(),
+            compartment_label: "default".into(),
+            payload: universe_state_payload(state),
+            created_at: "2026-06-22T13:00:00Z".into(),
+            updated_at: "2026-06-22T13:00:00Z".into(),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn universe_envelope_update_replay_and_stale_precondition() {
+    let store = UbuStore::in_memory().await.unwrap();
+    let mut state = populated_universe_state();
+    let first = seed_universe(&store, &state).await;
+    state.numeric_values.insert("energy".into(), 0.5);
+    let mut envelope = common::envelope_for(state.id.as_str(), ubu_core::VersionRef::Version(1));
+    envelope.created_time = UbuTimestamp::parse("2026-09-19T02:00:00Z").unwrap();
+    let updated =
+        queries::persist_universe_state(store.pool(), &envelope, &state, AuthoritySource::System)
+            .await
+            .unwrap();
+    assert_eq!(updated.version, 2);
+    assert_eq!(updated.created_at, first.created_at);
+    assert_eq!(updated.updated_at, envelope.recorded_time.to_string());
+    let payload: Value = serde_json::from_str(&updated.payload_json).unwrap();
+    assert_eq!(
+        payload["provenance"]["created_at"],
+        envelope.created_time.to_string()
+    );
+    assert_eq!(payload["schema_version"], "core/universe-state/0.1");
+    let audit = queries::get_recorded_mutation(store.pool(), &envelope.mutation_key())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(audit.result_version, 2);
+    assert_eq!(
+        serde_json::from_str::<ubu_core::MutationEnvelope>(&audit.envelope_json).unwrap(),
+        envelope
+    );
+    let before = common::ledger(store.pool()).await;
+    let changes: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let replay =
+        queries::persist_universe_state(store.pool(), &envelope, &state, AuthoritySource::System)
+            .await
+            .unwrap();
+    assert_eq!(replay, updated);
+    assert_eq!(common::ledger(store.pool()).await, before);
+    let after_changes: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(changes, after_changes);
+    let stale = common::envelope_for(state.id.as_str(), ubu_core::VersionRef::Version(1));
+    let error =
+        queries::persist_universe_state(store.pool(), &stale, &state, AuthoritySource::System)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(error, ubu_store::StoreError::PreconditionFailed { object_id, expected, actual }
+        if object_id == state.id.as_str() && expected == "v1" && actual == "v2")
+    );
+    assert_eq!(
+        queries::get_current_state(store.pool(), state.id.as_str())
+            .await
+            .unwrap(),
+        Some(updated)
+    );
+    assert_eq!(common::ledger(store.pool()).await, before);
+    assert_eq!(
+        queries::get_recorded_mutation(store.pool(), &stale.mutation_key())
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn universe_payload_or_authority_change_conflicts_on_replay() {
+    let store = UbuStore::in_memory().await.unwrap();
+    let state = populated_universe_state();
+    seed_universe(&store, &state).await;
+    let envelope = common::envelope_for(state.id.as_str(), ubu_core::VersionRef::Version(1));
+    let updated =
+        queries::persist_universe_state(store.pool(), &envelope, &state, AuthoritySource::System)
+            .await
+            .unwrap();
+    let ledger = common::ledger(store.pool()).await;
+    let mut changed = state.clone();
+    changed.numeric_values.insert("energy".into(), 0.1);
+    for (payload, authority) in [
+        (&changed, AuthoritySource::System),
+        (&state, AuthoritySource::User),
+    ] {
+        let error = queries::persist_universe_state(store.pool(), &envelope, payload, authority)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ubu_store::StoreError::Core(ubu_core::UbuError::IdempotencyKeyConflict { .. })
+        ));
+        assert_eq!(
+            queries::get_current_state(store.pool(), state.id.as_str())
+                .await
+                .unwrap(),
+            Some(updated.clone())
+        );
+        assert_eq!(common::ledger(store.pool()).await, ledger);
+    }
+}
+
+#[tokio::test]
+async fn universe_requires_version_target_and_checks_read_preconditions() {
+    let store = UbuStore::in_memory().await.unwrap();
+    let state = populated_universe_state();
+    let missing = common::append_envelope();
+    assert!(matches!(
+        queries::persist_universe_state(store.pool(), &missing, &state, AuthoritySource::System)
+            .await
+            .unwrap_err(),
+        ubu_store::StoreError::MissingTargetPrecondition { .. }
+    ));
+    let absent = common::envelope_for(state.id.as_str(), ubu_core::VersionRef::Absent);
+    assert!(matches!(
+        queries::persist_universe_state(store.pool(), &absent, &state, AuthoritySource::System)
+            .await
+            .unwrap_err(),
+        ubu_store::StoreError::PreconditionFailed { .. }
+    ));
+    assert_eq!(
+        queries::get_current_state(store.pool(), state.id.as_str())
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(common::ledger(store.pool()).await.is_empty());
+    let first = seed_universe(&store, &state).await;
+    let before = common::ledger(store.pool()).await;
+    let mut envelope = common::envelope_for(state.id.as_str(), ubu_core::VersionRef::Version(1));
+    envelope.observed_versions.insert(
+        UbuId::new(ObjectType::Task),
+        ubu_core::VersionRef::Version(7),
+    );
+    assert!(matches!(
+        queries::persist_universe_state(store.pool(), &envelope, &state, AuthoritySource::System)
+            .await
+            .unwrap_err(),
+        ubu_store::StoreError::PreconditionFailed { .. }
+    ));
+    assert_eq!(
+        queries::get_current_state(store.pool(), state.id.as_str())
+            .await
+            .unwrap(),
+        Some(first)
+    );
+    assert_eq!(common::ledger(store.pool()).await, before);
+}
+
+#[tokio::test]
+async fn universe_ledger_failure_rolls_back_updated_object() {
+    let store = UbuStore::in_memory().await.unwrap();
+    let mut state = populated_universe_state();
+    let first = seed_universe(&store, &state).await;
+    let before = common::ledger(store.pool()).await;
+    common::fail_ledger_inserts(store.pool()).await;
+    state.numeric_values.insert("energy".into(), 0.1);
+    let envelope = common::envelope_for(state.id.as_str(), ubu_core::VersionRef::Version(1));
+    let error =
+        queries::persist_universe_state(store.pool(), &envelope, &state, AuthoritySource::System)
+            .await
+            .unwrap_err();
+    assert!(error.to_string().contains("injected ledger failure"));
+    assert_eq!(
+        queries::get_current_state(store.pool(), state.id.as_str())
+            .await
+            .unwrap(),
+        Some(first)
+    );
+    assert_eq!(common::ledger(store.pool()).await, before);
+    assert_eq!(
+        queries::get_recorded_mutation(store.pool(), &envelope.mutation_key())
+            .await
+            .unwrap(),
+        None
+    );
 }

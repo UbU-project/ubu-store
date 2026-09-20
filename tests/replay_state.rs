@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::json;
 use ubu_core::id_registry::ObjectType;
 use ubu_core::UbuId;
@@ -10,6 +12,7 @@ async fn replays_object_history_from_logs() {
     let object_id = UbuId::new(ObjectType::Task).to_string();
     queries::append_log_entry(
         store.pool(),
+        &common::append_envelope(),
         NewLogRecord {
             id: UbuId::new(ObjectType::LogEntry).to_string(),
             event_type: "object_admitted".to_owned(),
