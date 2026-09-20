@@ -350,36 +350,70 @@ pub async fn admit_candidate_object(
     insert_object_row_without_envelope(pool, record).await
 }
 
-pub async fn append_log_entry(pool: &SqlitePool, record: NewLogRecord) -> Result<LogRecord> {
-    validate_object_id_for_type(&record.id, ObjectType::LogEntry.as_str())?;
-    validate_provenance_json(&record.provenance)?;
-    if record.event_type == "recalculation_requested" {
-        validate_recalculation_trigger_payload(&record.payload)?;
-    }
-    UbuTimestamp::parse(&record.created_at)?;
-    let object_refs_json = serde_json::to_string(&record.object_refs)?;
-    let payload_json = serde_json::to_string(&record.payload)?;
-    let provenance_json = serde_json::to_string(&record.provenance)?;
+/// Append a canonical fact. The log id needs no object-version precondition;
+/// all supplied read preconditions are enforced. Replay compares record.payload.
+pub async fn append_log_entry(
+    pool: &SqlitePool,
+    envelope: &MutationEnvelope,
+    record: NewLogRecord,
+) -> Result<LogRecord> {
+    let mut transaction = crate::transactions::begin(pool).await?;
+    let result = async {
+        let prepared = prepare_mutation(
+            &mut transaction,
+            envelope,
+            &record.payload,
+            MutationTarget::Log,
+        )
+        .await?;
+        if let Some(replay) = prepared.replay {
+            return sqlx::query_as::<_, LogRecord>("SELECT * FROM logs WHERE id = ?")
+                .bind(replay.result_object_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(Into::into);
+        }
+        validate_object_id_for_type(&record.id, ObjectType::LogEntry.as_str())?;
+        validate_provenance_json(&record.provenance)?;
+        if record.event_type == "recalculation_requested" {
+            validate_recalculation_trigger_payload(&record.payload)?;
+        }
+        UbuTimestamp::parse(&record.created_at)?;
+        let object_refs_json = serde_json::to_string(&record.object_refs)?;
+        let payload_json = serde_json::to_string(&record.payload)?;
+        let provenance_json = serde_json::to_string(&record.provenance)?;
 
-    sqlx::query(
-        "INSERT INTO logs
+        sqlx::query(
+            "INSERT INTO logs
         (id, event_type, object_refs_json, payload_json, provenance_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&record.id)
-    .bind(&record.event_type)
-    .bind(&object_refs_json)
-    .bind(&payload_json)
-    .bind(&provenance_json)
-    .bind(&record.created_at)
-    .execute(pool)
-    .await?;
-
-    sqlx::query_as::<_, LogRecord>("SELECT * FROM logs WHERE id = ?")
+        )
         .bind(&record.id)
-        .fetch_one(pool)
-        .await
-        .map_err(Into::into)
+        .bind(&record.event_type)
+        .bind(&object_refs_json)
+        .bind(&payload_json)
+        .bind(&provenance_json)
+        .bind(&record.created_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        record_mutation(
+            &mut transaction,
+            envelope,
+            &prepared.canonical_payload,
+            &record.id,
+            0,
+        )
+        .await?;
+
+        sqlx::query_as::<_, LogRecord>("SELECT * FROM logs WHERE id = ?")
+            .bind(&record.id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(Into::into)
+    }
+    .await;
+    finish_mutation(transaction, result).await
 }
 
 /// Look up an admission audit row by its complete device-scoped duplicate key.
