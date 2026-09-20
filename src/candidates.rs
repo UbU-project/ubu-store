@@ -342,3 +342,56 @@ pub async fn admit_advisory_candidate(
     .await;
     finish_mutation(transaction, result).await
 }
+
+/// Active review surface only. SQLite sorts absent review_order before numbers;
+/// creation time breaks ties, then candidate id makes equal timestamps stable.
+pub async fn review_queue(pool: &SqlitePool) -> Result<Vec<CandidateRecord>> {
+    sqlx::query_as(
+        "SELECT * FROM advisory_candidates WHERE lifecycle_state IN ('proposed', 'resurfaced')
+        ORDER BY review_order ASC, created_at ASC, advisory_candidate_id ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn get_advisory_candidate(
+    pool: &SqlitePool,
+    id: &AdvisoryCandidateId,
+) -> Result<Option<CandidateRecord>> {
+    sqlx::query_as("SELECT * FROM advisory_candidates WHERE advisory_candidate_id = ?")
+        .bind(id.as_str())
+        .fetch_optional(pool)
+        .await
+        .map_err(Into::into)
+}
+
+pub async fn list_candidate_decision_events(
+    pool: &SqlitePool,
+    id: &AdvisoryCandidateId,
+) -> Result<Vec<CandidateDecisionEvent>> {
+    // Version order preserves decision order even for equal/backdated timestamps.
+    sqlx::query_as(
+        "SELECT * FROM candidate_decision_events WHERE advisory_candidate_id = ?
+        ORDER BY observed_candidate_version ASC, id ASC",
+    )
+    .bind(id.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn find_suppression_record(
+    pool: &SqlitePool,
+    suppression_key: &str,
+) -> Result<Option<SuppressionRecord>> {
+    let payload: Option<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM suppression_records WHERE suppression_key = ?",
+    )
+    .bind(suppression_key)
+    .fetch_optional(pool)
+    .await?;
+    payload
+        .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+        .transpose()
+}

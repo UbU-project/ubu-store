@@ -450,6 +450,11 @@ pub async fn get_current_state<'e, E>(executor: E, id: &str) -> Result<Option<Ob
 where
     E: Executor<'e, Database = Sqlite>,
 {
+    // Candidate identities are deliberately outside UbuId's admitted registry.
+    // They have no admitted current state, even when present in review storage.
+    if ubu_core::AdvisoryCandidateId::parse(id).is_ok() {
+        return Ok(None);
+    }
     UbuId::parse(id.to_owned())?;
     sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects WHERE id = ?")
         .bind(id)
