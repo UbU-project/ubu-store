@@ -1,13 +1,15 @@
+mod common;
+
 use serde_json::json;
 use ubu_core::id_registry::ObjectType;
 use ubu_core::UbuId;
 use ubu_store::models::object_record::NewObjectRecord;
-use ubu_store::{queries, UbuStore};
+use ubu_store::UbuStore;
 
 #[tokio::test]
 async fn rejects_invalid_compartment_label() {
     let store = UbuStore::in_memory().await.expect("store initializes");
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: UbuId::new(ObjectType::Task).to_string(),

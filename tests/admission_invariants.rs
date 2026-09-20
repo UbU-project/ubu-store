@@ -1,9 +1,11 @@
+mod common;
+
 use serde_json::json;
 use ubu_core::id_registry::ObjectType;
 use ubu_core::UbuId;
 use ubu_store::admission::object_type_from_str;
 use ubu_store::models::object_record::NewObjectRecord;
-use ubu_store::{queries, UbuStore};
+use ubu_store::UbuStore;
 
 #[test]
 fn accepts_new_core_object_type_names() {
@@ -29,7 +31,7 @@ async fn admits_preference_with_canonical_envelope() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let preference_id = UbuId::new(ObjectType::Preference).to_string();
 
-    let admitted = queries::admit_object(
+    let admitted = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: preference_id.clone(),
@@ -58,7 +60,7 @@ async fn rejects_payload_without_canonical_id() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let preference_id = UbuId::new(ObjectType::Preference).to_string();
 
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: preference_id,
@@ -86,7 +88,7 @@ async fn rejects_payload_id_that_does_not_match_record_id() {
     let record_id = UbuId::new(ObjectType::Preference).to_string();
     let payload_id = UbuId::new(ObjectType::Preference).to_string();
 
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: record_id,
@@ -114,7 +116,7 @@ async fn rejects_non_positive_object_version() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let preference_id = UbuId::new(ObjectType::Preference).to_string();
 
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: preference_id.clone(),
@@ -142,7 +144,7 @@ async fn rejects_payload_provenance_without_authority_source() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let task_id = UbuId::new(ObjectType::Task).to_string();
 
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: task_id.clone(),
@@ -172,7 +174,7 @@ async fn rejects_preference_without_authority_source() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let preference_id = UbuId::new(ObjectType::Preference).to_string();
 
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: preference_id.clone(),
@@ -199,7 +201,7 @@ async fn admits_compartment_with_required_label_metadata() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let compartment_id = UbuId::new(ObjectType::Compartment).to_string();
 
-    let admitted = queries::admit_object(
+    let admitted = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: compartment_id.clone(),
@@ -226,7 +228,7 @@ async fn rejects_compartment_without_required_label_metadata() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let compartment_id = UbuId::new(ObjectType::Compartment).to_string();
 
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: compartment_id.clone(),

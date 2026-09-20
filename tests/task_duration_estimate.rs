@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::{json, Value};
 use ubu_core::id_registry::ObjectType;
 use ubu_core::UbuId;
@@ -42,7 +44,7 @@ async fn admit_and_query(record: NewObjectRecord) -> Value {
     let id = record.id.clone();
     let expected = record.payload.clone();
 
-    queries::admit_object(store.pool(), record)
+    common::admit_object(store.pool(), record)
         .await
         .expect("task is admitted");
     let queried = queries::get_current_state(store.pool(), &id)
@@ -106,7 +108,7 @@ async fn rejects_invalid_three_point_duration_ordering() {
         }
     }));
 
-    let error = queries::admit_object(store.pool(), record)
+    let error = common::admit_object(store.pool(), record)
         .await
         .expect_err("invalid ordering is rejected");
     assert!(error.to_string().contains("min_seconds < mode_seconds"));

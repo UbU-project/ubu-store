@@ -1,6 +1,9 @@
 use serde_json::json;
 use ubu_core::id_registry::ObjectType;
-use ubu_core::UbuId;
+use ubu_core::{
+    AuthoritySource, CausalityIssuer, DeviceId, EnvelopeRequest, LocalIssuer, UbuId, UbuTimestamp,
+    VersionRef,
+};
 use ubu_store::models::object_record::NewObjectRecord;
 use ubu_store::{init_store, queries};
 
@@ -18,6 +21,16 @@ async fn main() -> ubu_store::Result<()> {
         created_at: now.clone(),
         updated_at: now,
     };
-    queries::admit_object(store.pool(), task).await?;
+    // Restore this identifier from registration material in a real installation.
+    let issuer = LocalIssuer::new(DeviceId::parse("example-registered-device")?);
+    let envelope = issuer.issue(EnvelopeRequest {
+        observed_versions: [(UbuId::parse(&task.id)?, VersionRef::Absent)].into(),
+        actor_identity_id: UbuId::new(ObjectType::Identity),
+        authority_source: AuthoritySource::User,
+        effective_time: UbuTimestamp::parse(&task.updated_at)?,
+        observed_policy_versions: None,
+        execution_context: None,
+    })?;
+    queries::admit_object(store.pool(), &envelope, task).await?;
     Ok(())
 }

@@ -1,13 +1,15 @@
+mod common;
+
 use serde_json::json;
 use ubu_core::id_registry::ObjectType;
 use ubu_core::UbuId;
 use ubu_store::models::object_record::NewObjectRecord;
-use ubu_store::{queries, UbuStore};
+use ubu_store::UbuStore;
 
 #[tokio::test]
 async fn rejects_invalid_object_id() {
     let store = UbuStore::in_memory().await.expect("store initializes");
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: "bad_018f3c8e9b2a7c4d8f1e2a3b4c5d6e7f".to_owned(),
@@ -29,7 +31,7 @@ async fn rejects_invalid_object_id() {
 async fn rejects_noncanonical_task_status() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     for status in ["canceled", "ready", "in_progress", "proposed", "blocked"] {
-        let result = queries::admit_object(
+        let result = common::admit_object(
             store.pool(),
             NewObjectRecord {
                 id: UbuId::new(ObjectType::Task).to_string(),
@@ -52,7 +54,7 @@ async fn rejects_noncanonical_task_status() {
 #[tokio::test]
 async fn rejects_moot_task_without_payload_reason() {
     let store = UbuStore::in_memory().await.expect("store initializes");
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: UbuId::new(ObjectType::Task).to_string(),
@@ -74,7 +76,7 @@ async fn rejects_moot_task_without_payload_reason() {
 async fn admits_moot_task_with_payload_reason() {
     let store = UbuStore::in_memory().await.expect("store initializes");
     let task_id = UbuId::new(ObjectType::Task).to_string();
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: task_id.clone(),

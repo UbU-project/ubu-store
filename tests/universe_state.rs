@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
@@ -14,7 +16,7 @@ async fn admits_universe_state_and_round_trips_all_collections() {
     let state = populated_universe_state();
     let payload = universe_state_payload(&state);
 
-    let admitted = queries::admit_object(
+    let admitted = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: state.id.to_string(),
@@ -84,7 +86,7 @@ async fn rejects_universe_state_without_provenance_authority_source() {
         "created_at": "2026-06-22T13:00:00Z"
     });
 
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: state.id.to_string(),
@@ -110,7 +112,7 @@ async fn rejects_universe_state_with_non_ustate_id_prefix() {
     let mut payload = universe_state_payload(&state);
     payload["id"] = json!(task_id);
 
-    let result = queries::admit_object(
+    let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: task_id,
@@ -134,7 +136,7 @@ async fn persists_updated_universe_state_as_new_current_version() {
     let state = populated_universe_state();
     let payload = universe_state_payload(&state);
 
-    queries::admit_object(
+    common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: state.id.to_string(),
