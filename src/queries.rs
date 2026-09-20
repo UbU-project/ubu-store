@@ -1,8 +1,8 @@
 use serde_json::Value;
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 use ubu_core::core::UniverseState;
 use ubu_core::id_registry::ObjectType;
-use ubu_core::store::CandidateObject;
+use ubu_core::store::{canonical_payload_bytes, CandidateObject, MutationEnvelope, VersionRef};
 use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
 
 use crate::admission::{
@@ -24,29 +24,143 @@ use crate::models::projection_record::{
 use crate::models::worker_submission_record::{NewWorkerSubmissionRecord, WorkerSubmissionRecord};
 use crate::recalculation::validate_recalculation_trigger_payload;
 
-pub async fn admit_object(pool: &SqlitePool, record: NewObjectRecord) -> Result<ObjectRecord> {
-    validate_object_record(&record)?;
-    let payload_json = serde_json::to_string(&record.payload)?;
+/// Admit one canonical object mutation atomically with its envelope.
+/// Device registration/trust and policy-version enforcement belong to later tickets.
+/// Replay equality is deliberately defined over `record.payload` alone. A replay
+/// reads the recorded target's current state; the ledger is not historical state.
+pub async fn admit_object(
+    pool: &SqlitePool,
+    envelope: &MutationEnvelope,
+    mut record: NewObjectRecord,
+) -> Result<ObjectRecord> {
+    let mut transaction = crate::transactions::begin(pool).await?;
+    let result: Result<ObjectRecord> = async {
+        envelope.validate()?;
+        let key = envelope.mutation_key();
+        let canonical_payload = String::from_utf8(canonical_payload_bytes(&record.payload))
+            .expect("canonical JSON bytes are UTF-8");
+        let replay: Option<(String, String)> = sqlx::query_as(
+            "SELECT canonical_payload, result_object_id FROM mutation_envelopes
+             WHERE origin_device_id = ? AND idempotency_key = ?",
+        )
+        .bind(key.origin_device_id.as_str())
+        .bind(key.idempotency_key.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some((previous_payload, object_id)) = replay {
+            if previous_payload != canonical_payload {
+                return Err(ubu_core::UbuError::IdempotencyKeyConflict {
+                    origin_device_id: key.origin_device_id.as_str().to_owned(),
+                    idempotency_key: key.idempotency_key.as_str().to_owned(),
+                }.into());
+            }
+            return get_current_state(&mut *transaction, &object_id)
+                .await?
+                .ok_or_else(|| StoreError::RecordedMutationObjectMissing { object_id });
+        }
 
-    sqlx::query(
-        "INSERT INTO objects
-        (id, object_type, version, status, compartment_label, payload_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&record.id)
-    .bind(&record.object_type)
-    .bind(record.version)
-    .bind(&record.status)
-    .bind(&record.compartment_label)
-    .bind(&payload_json)
-    .bind(&record.created_at)
-    .bind(&record.updated_at)
-    .execute(pool)
-    .await?;
+        for (object_id, expected) in &envelope.observed_versions {
+            let actual: Option<i64> = sqlx::query_scalar("SELECT version FROM objects WHERE id = ?")
+                .bind(object_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await?;
+            let matches = match (expected, actual) {
+                (VersionRef::Absent, None) => true,
+                (VersionRef::Version(expected), Some(actual)) => u64::try_from(actual).ok() == Some(*expected),
+                _ => false,
+            };
+            if !matches {
+                return Err(StoreError::PreconditionFailed {
+                    object_id: object_id.as_str().to_owned(),
+                    expected: match expected {
+                        VersionRef::Absent => "absent".to_owned(),
+                        VersionRef::Version(version) => format!("v{version}"),
+                    },
+                    actual: actual.map_or_else(|| "absent".to_owned(), |version| format!("v{version}")),
+                });
+            }
+        }
 
-    Ok(get_current_state(pool, &record.id)
-        .await?
-        .expect("inserted object is readable"))
+        let target = UbuId::parse(&record.id)?;
+        let expected = envelope.observed_versions.get(&target).ok_or_else(|| {
+            StoreError::MissingTargetPrecondition { object_id: record.id.clone() }
+        })?;
+        // Retain all existing record validation, including rejecting non-positive
+        // supplied versions. The envelope, not a supplied positive version,
+        // determines the version actually written.
+        validate_object_record(&record)?;
+        let payload_json = serde_json::to_string(&record.payload)?;
+        match expected {
+            VersionRef::Absent => {
+                record.version = 1;
+                sqlx::query(
+                    "INSERT INTO objects
+                     (id, object_type, version, status, compartment_label, payload_json, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&record.id)
+                .bind(&record.object_type)
+                .bind(record.version)
+                .bind(&record.status)
+                .bind(&record.compartment_label)
+                .bind(&payload_json)
+                .bind(&record.created_at)
+                .bind(&record.updated_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            VersionRef::Version(version) => {
+                record.version = i64::try_from(*version).ok().and_then(|v| v.checked_add(1))
+                    .ok_or_else(|| StoreError::ObjectVersionExhausted {
+                        object_id: record.id.clone(), version: *version,
+                    })?;
+                sqlx::query(
+                    "UPDATE objects SET version = ?, status = ?, compartment_label = ?,
+                     payload_json = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(record.version)
+                .bind(&record.status)
+                .bind(&record.compartment_label)
+                .bind(&payload_json)
+                .bind(&record.updated_at)
+                .bind(&record.id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "INSERT INTO mutation_envelopes
+             (origin_device_id, idempotency_key, envelope_json, canonical_payload,
+              result_object_id, result_version, recorded_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key.origin_device_id.as_str())
+        .bind(key.idempotency_key.as_str())
+        .bind(serde_json::to_string(envelope)?)
+        .bind(canonical_payload)
+        .bind(&record.id)
+        .bind(record.version)
+        .bind(envelope.recorded_time.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
+        // Read on the transaction's connection, avoiding a second pool checkout
+        // (the store has one connection), then return only after commit succeeds.
+        get_current_state(&mut *transaction, &record.id)
+            .await?
+            .ok_or_else(|| StoreError::RecordedMutationObjectMissing { object_id: record.id.clone() })
+    }.await;
+
+    match result {
+        Ok(record) => {
+            transaction.commit().await?;
+            Ok(record)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 pub async fn admit_candidate_object(
@@ -100,11 +214,14 @@ pub async fn append_log_entry(pool: &SqlitePool, record: NewLogRecord) -> Result
         .map_err(Into::into)
 }
 
-pub async fn get_current_state(pool: &SqlitePool, id: &str) -> Result<Option<ObjectRecord>> {
+pub async fn get_current_state<'e, E>(executor: E, id: &str) -> Result<Option<ObjectRecord>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     UbuId::parse(id.to_owned())?;
     sqlx::query_as::<_, ObjectRecord>("SELECT * FROM objects WHERE id = ?")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(Into::into)
 }
