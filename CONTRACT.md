@@ -6,6 +6,19 @@
 
 Canonical objects must pass admission before insertion:
 
+All canonical writers require `&MutationEnvelope`: `admit_object`,
+`persist_universe_state`, `append_log_entry`, and `store_external_reference`.
+They share envelope validation, Device-scoped replay detection, object-version
+preconditions, ledger recording, and transactional rollback. Logs and external
+references are append-only and need no target entry in `observed_versions`.
+UniverseState updates require an existing-version target precondition.
+
+The writer classification in `src/queries.rs` and the
+[canonical writer audit](docs/CANONICAL_WRITER_AUDIT.md) must be updated when adding
+a writer. The sole tracked exception is `admit_candidate_object`: its private
+legacy writer still puts candidates into `objects`, violating UBU-D0274 until
+P1B-4. It does not authorize another envelope-free canonical path.
+
 - ID must be a valid `ubu_core::UbuId`.
 - Declared `object_type` must be known to `ubu_core`.
 - ID prefix must match the declared object type. For example, `Task` requires `task_`.
