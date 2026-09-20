@@ -552,34 +552,69 @@ pub async fn query_active_tasks(pool: &SqlitePool) -> Result<Vec<ObjectRecord>> 
     .map_err(Into::into)
 }
 
+/// Append a canonical external reference. No target object version is required;
+/// supplied read preconditions and the global per-Device replay key still apply.
 pub async fn store_external_reference(
     pool: &SqlitePool,
+    envelope: &MutationEnvelope,
     record: NewExternalReferenceRecord,
 ) -> Result<ExternalReferenceRecord> {
-    validate_object_id_for_type(&record.id, ObjectType::ExternalReference.as_str())?;
-    UbuTimestamp::parse(&record.created_at)?;
-    let payload_json = serde_json::to_string(&record.payload)?;
+    let mut transaction = crate::transactions::begin(pool).await?;
+    let result = async {
+        let prepared = prepare_mutation(
+            &mut transaction,
+            envelope,
+            &record.payload,
+            MutationTarget::ExternalReference,
+        )
+        .await?;
+        if let Some(replay) = prepared.replay {
+            return sqlx::query_as::<_, ExternalReferenceRecord>(
+                "SELECT * FROM external_references WHERE id = ?",
+            )
+            .bind(replay.result_object_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(Into::into);
+        }
+        validate_object_id_for_type(&record.id, ObjectType::ExternalReference.as_str())?;
+        UbuTimestamp::parse(&record.created_at)?;
+        let payload_json = serde_json::to_string(&record.payload)?;
 
-    sqlx::query(
-        "INSERT INTO external_references
+        sqlx::query(
+            "INSERT INTO external_references
         (id, source_type, source_id, url, payload_hash, payload_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&record.id)
-    .bind(&record.source_type)
-    .bind(&record.source_id)
-    .bind(&record.url)
-    .bind(&record.payload_hash)
-    .bind(&payload_json)
-    .bind(&record.created_at)
-    .execute(pool)
-    .await?;
-
-    sqlx::query_as::<_, ExternalReferenceRecord>("SELECT * FROM external_references WHERE id = ?")
+        )
         .bind(&record.id)
-        .fetch_one(pool)
+        .bind(&record.source_type)
+        .bind(&record.source_id)
+        .bind(&record.url)
+        .bind(&record.payload_hash)
+        .bind(&payload_json)
+        .bind(&record.created_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        record_mutation(
+            &mut transaction,
+            envelope,
+            &prepared.canonical_payload,
+            &record.id,
+            0,
+        )
+        .await?;
+
+        sqlx::query_as::<_, ExternalReferenceRecord>(
+            "SELECT * FROM external_references WHERE id = ?",
+        )
+        .bind(&record.id)
+        .fetch_one(&mut *transaction)
         .await
         .map_err(Into::into)
+    }
+    .await;
+    finish_mutation(transaction, result).await
 }
 
 pub async fn query_external_references(
