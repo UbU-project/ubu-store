@@ -15,9 +15,12 @@ UniverseState updates require an existing-version target precondition.
 
 The writer classification in `src/queries.rs` and the
 [canonical writer audit](docs/CANONICAL_WRITER_AUDIT.md) must be updated when adding
-a writer. The sole tracked exception is `admit_candidate_object`: its private
-legacy writer still puts candidates into `objects`, violating UBU-D0274 until
-P1B-4. It does not authorize another envelope-free canonical path.
+a writer. Candidate proposals are stored only in `advisory_candidates` and accessed
+through review APIs. Candidate decisions carry envelopes for provenance and retry
+safety. `admit_advisory_candidate` composes ordinary canonical admission, candidate
+transition, and its linked decision event in one transaction. Rejection stores
+suppression metadata and a review event without creating proposed canonical state.
+There is no envelope-free candidate-to-object writer.
 
 - ID must be a valid `ubu_core::UbuId`.
 - Declared `object_type` must be known to `ubu_core`.

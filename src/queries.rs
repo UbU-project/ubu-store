@@ -10,7 +10,10 @@
 //! | `store_plan`, `store_calendar` | `derived_state` | Exempt: derived artifacts, not canonical admission. |
 //! | `store_projection_preview`, `store_projection_result` | `projection_state` | Exempt: projection artifacts, not canonical admission. |
 //! | `store_worker_submission` | noncanonical submission | Exempt: submissions require admission before becoming canonical, per CONTRACT.md. |
-//! | `admit_candidate_object` | `candidate_state` (defective today) | Exempt: sole UBU-D0274 exception through a private writer; P1B-4 will separate candidate storage. |
+//! | `store_advisory_candidate` | `candidate_state` | Required: provenance/idempotency for isolated proposal storage, never admission. |
+//! | `transition_advisory_candidate`, `reject_advisory_candidate` | `candidate_state` + review decisions | Required: Device-scoped replay and first-class decision provenance; no canonical object write. |
+//! | `admit_advisory_candidate` | admitted canonical + review decision | Required: one transaction admits the ordinary object mutation and links its candidate decision. |
+//! | candidate decision events (private `write_decision`) | review events | Required: UBU-D0274 decision fields are the envelope fields; retry-safe decisions share the Device-global key. |
 //!
 //! Exempt artifact storage does not authorize canonical recording, invalidation,
 //! or publication mutations without an envelope. Device-registry consultation
@@ -21,7 +24,7 @@ use sqlx::{Executor, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use ubu_core::core::UniverseState;
 use ubu_core::id_registry::ObjectType;
 use ubu_core::store::{
-    canonical_payload_bytes, CandidateObject, MutationEnvelope, MutationKey, VersionRef,
+    canonical_payload_bytes, MutationEnvelope, MutationKey, VersionRef,
 };
 use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
 
@@ -310,56 +313,6 @@ pub(crate) async fn admit_prepared_object(
         connection, envelope, &prepared.canonical_payload, &admitted.id, admitted.version,
     ).await?;
     Ok(admitted)
-}
-
-/// UBU-D0274 violation retained solely for `admit_candidate_object`: candidate
-/// proposals are still inserted into canonical `objects` as active version 1.
-/// P1B-4 will separate candidate_state. Do not use this writer for canonical mutations.
-async fn insert_object_row_without_envelope(
-    pool: &SqlitePool,
-    record: NewObjectRecord,
-) -> Result<ObjectRecord> {
-    validate_object_record(&record)?;
-    let payload_json = serde_json::to_string(&record.payload)?;
-
-    sqlx::query(
-        "INSERT INTO objects
-        (id, object_type, version, status, compartment_label, payload_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&record.id)
-    .bind(&record.object_type)
-    .bind(record.version)
-    .bind(&record.status)
-    .bind(&record.compartment_label)
-    .bind(&payload_json)
-    .bind(&record.created_at)
-    .bind(&record.updated_at)
-    .execute(pool)
-    .await?;
-
-    Ok(get_current_state(pool, &record.id)
-        .await?
-        .expect("inserted object is readable"))
-}
-
-pub async fn admit_candidate_object(
-    pool: &SqlitePool,
-    candidate: CandidateObject,
-    compartment_label: &str,
-) -> Result<ObjectRecord> {
-    let now = UbuTimestamp::now_utc().to_string();
-    let record = NewObjectRecord {
-        id: candidate.candidate_id,
-        object_type: candidate.object_type,
-        version: 1,
-        status: "active".to_owned(),
-        compartment_label: compartment_label.to_owned(),
-        payload: candidate.payload,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    insert_object_row_without_envelope(pool, record).await
 }
 
 /// Append a canonical fact. The log id needs no object-version precondition;
