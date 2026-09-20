@@ -20,6 +20,12 @@ pub enum StoreError {
     #[error("recorded mutation target `{object_id}` has no current state")]
     RecordedMutationObjectMissing { object_id: String },
 
+    #[error("recorded mutation target `{object_id}` is not a result in `{expected_table}`")]
+    ReplayTargetMismatch {
+        object_id: String,
+        expected_table: &'static str,
+    },
+
     #[error(transparent)]
     Core(#[from] ubu_core::UbuError),
 

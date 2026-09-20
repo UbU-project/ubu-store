@@ -17,7 +17,7 @@
 //! and policy-version enforcement remain later work.
 
 use serde_json::Value;
-use sqlx::{Executor, Sqlite, SqlitePool};
+use sqlx::{Executor, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use ubu_core::core::UniverseState;
 use ubu_core::id_registry::ObjectType;
 use ubu_core::store::{
@@ -45,133 +45,140 @@ use crate::models::recorded_mutation::RecordedMutation;
 use crate::models::worker_submission_record::{NewWorkerSubmissionRecord, WorkerSubmissionRecord};
 use crate::recalculation::validate_recalculation_trigger_payload;
 
-/// Admit one canonical object mutation atomically with its envelope.
-/// Device registration/trust and policy-version enforcement belong to later tickets.
-/// Replay equality is deliberately defined over `record.payload` alone. A replay
-/// reads the recorded target's current state; the ledger is not historical state.
-pub async fn admit_object(
-    pool: &SqlitePool,
+/// The unchanged ledger has no table column. Positive result versions denote
+/// objects; zero denotes an unversioned append result, whose id identifies its
+/// log/xref kind. Keys remain global per Device, never scoped to this enum.
+#[derive(Clone, Copy)]
+enum MutationTarget {
+    Object,
+    Log,
+    ExternalReference,
+}
+
+impl MutationTarget {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Object => "objects",
+            Self::Log => "logs",
+            Self::ExternalReference => "external_references",
+        }
+    }
+
+    fn accepts(self, recorded: &RecordedMutation) -> bool {
+        match self {
+            Self::Object => recorded.result_version > 0,
+            Self::Log | Self::ExternalReference => {
+                let expected = match self {
+                    Self::Log => ObjectType::LogEntry,
+                    _ => ObjectType::ExternalReference,
+                };
+                recorded.result_version == 0
+                    && UbuId::parse(&recorded.result_object_id)
+                        .and_then(|id| id.require_object_type(expected))
+                        .is_ok()
+            }
+        }
+    }
+}
+
+struct PreparedMutation {
+    canonical_payload: String,
+    replay: Option<RecordedMutation>,
+}
+
+/// Validate and check the shared device-scoped ledger before any preconditions.
+/// Payload equality is unchanged for admit_object and applies to record.payload
+/// for append-only writers. A same-payload key cannot switch result tables.
+async fn prepare_mutation(
+    connection: &mut SqliteConnection,
     envelope: &MutationEnvelope,
-    mut record: NewObjectRecord,
-) -> Result<ObjectRecord> {
-    let mut transaction = crate::transactions::begin(pool).await?;
-    let result: Result<ObjectRecord> = async {
-        envelope.validate()?;
-        let key = envelope.mutation_key();
-        let canonical_payload = String::from_utf8(canonical_payload_bytes(&record.payload))
-            .expect("canonical JSON bytes are UTF-8");
-        let replay: Option<(String, String)> = sqlx::query_as(
-            "SELECT canonical_payload, result_object_id FROM mutation_envelopes
-             WHERE origin_device_id = ? AND idempotency_key = ?",
-        )
-        .bind(key.origin_device_id.as_str())
-        .bind(key.idempotency_key.as_str())
-        .fetch_optional(&mut *transaction)
-        .await?;
-        if let Some((previous_payload, object_id)) = replay {
-            if previous_payload != canonical_payload {
-                return Err(ubu_core::UbuError::IdempotencyKeyConflict {
-                    origin_device_id: key.origin_device_id.as_str().to_owned(),
-                    idempotency_key: key.idempotency_key.as_str().to_owned(),
-                }.into());
+    payload: &Value,
+    target: MutationTarget,
+) -> Result<PreparedMutation> {
+    envelope.validate()?;
+    let key = envelope.mutation_key();
+    let canonical_payload = String::from_utf8(canonical_payload_bytes(payload))
+        .expect("canonical JSON bytes are UTF-8");
+    let replay = get_recorded_mutation(&mut *connection, &key).await?;
+    if let Some(recorded) = &replay {
+        if recorded.canonical_payload != canonical_payload {
+            return Err(ubu_core::UbuError::IdempotencyKeyConflict {
+                origin_device_id: key.origin_device_id.as_str().to_owned(),
+                idempotency_key: key.idempotency_key.as_str().to_owned(),
             }
-            return get_current_state(&mut *transaction, &object_id)
-                .await?
-                .ok_or_else(|| StoreError::RecordedMutationObjectMissing { object_id });
+            .into());
         }
-
-        for (object_id, expected) in &envelope.observed_versions {
-            let actual: Option<i64> = sqlx::query_scalar("SELECT version FROM objects WHERE id = ?")
-                .bind(object_id.as_str())
-                .fetch_optional(&mut *transaction)
-                .await?;
-            let matches = match (expected, actual) {
-                (VersionRef::Absent, None) => true,
-                (VersionRef::Version(expected), Some(actual)) => u64::try_from(actual).ok() == Some(*expected),
-                _ => false,
-            };
-            if !matches {
-                return Err(StoreError::PreconditionFailed {
-                    object_id: object_id.as_str().to_owned(),
-                    expected: match expected {
-                        VersionRef::Absent => "absent".to_owned(),
-                        VersionRef::Version(version) => format!("v{version}"),
-                    },
-                    actual: actual.map_or_else(|| "absent".to_owned(), |version| format!("v{version}")),
-                });
-            }
+        if !target.accepts(recorded) {
+            return Err(StoreError::ReplayTargetMismatch {
+                object_id: recorded.result_object_id.clone(),
+                expected_table: target.table(),
+            });
         }
+    } else {
+        check_preconditions(connection, envelope).await?;
+    }
+    Ok(PreparedMutation {
+        canonical_payload,
+        replay,
+    })
+}
 
-        let target = UbuId::parse(&record.id)?;
-        let expected = envelope.observed_versions.get(&target).ok_or_else(|| {
-            StoreError::MissingTargetPrecondition { object_id: record.id.clone() }
-        })?;
-        // Retain all existing record validation, including rejecting non-positive
-        // supplied versions. The envelope, not a supplied positive version,
-        // determines the version actually written.
-        validate_object_record(&record)?;
-        let payload_json = serde_json::to_string(&record.payload)?;
-        match expected {
-            VersionRef::Absent => {
-                record.version = 1;
-                sqlx::query(
-                    "INSERT INTO objects
-                     (id, object_type, version, status, compartment_label, payload_json, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(&record.id)
-                .bind(&record.object_type)
-                .bind(record.version)
-                .bind(&record.status)
-                .bind(&record.compartment_label)
-                .bind(&payload_json)
-                .bind(&record.created_at)
-                .bind(&record.updated_at)
-                .execute(&mut *transaction)
-                .await?;
+async fn check_preconditions(
+    connection: &mut SqliteConnection,
+    envelope: &MutationEnvelope,
+) -> Result<()> {
+    for (object_id, expected) in &envelope.observed_versions {
+        let actual: Option<i64> = sqlx::query_scalar("SELECT version FROM objects WHERE id = ?")
+            .bind(object_id.as_str())
+            .fetch_optional(&mut *connection)
+            .await?;
+        let matches = match (expected, actual) {
+            (VersionRef::Absent, None) => true,
+            (VersionRef::Version(expected), Some(actual)) => {
+                u64::try_from(actual).ok() == Some(*expected)
             }
-            VersionRef::Version(version) => {
-                record.version = i64::try_from(*version).ok().and_then(|v| v.checked_add(1))
-                    .ok_or_else(|| StoreError::ObjectVersionExhausted {
-                        object_id: record.id.clone(), version: *version,
-                    })?;
-                sqlx::query(
-                    "UPDATE objects SET version = ?, status = ?, compartment_label = ?,
-                     payload_json = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(record.version)
-                .bind(&record.status)
-                .bind(&record.compartment_label)
-                .bind(&payload_json)
-                .bind(&record.updated_at)
-                .bind(&record.id)
-                .execute(&mut *transaction)
-                .await?;
-            }
+            _ => false,
+        };
+        if !matches {
+            return Err(StoreError::PreconditionFailed {
+                object_id: object_id.as_str().to_owned(),
+                expected: match expected {
+                    VersionRef::Absent => "absent".to_owned(),
+                    VersionRef::Version(version) => format!("v{version}"),
+                },
+                actual: actual.map_or_else(|| "absent".to_owned(), |version| format!("v{version}")),
+            });
         }
-        sqlx::query(
-            "INSERT INTO mutation_envelopes
-             (origin_device_id, idempotency_key, envelope_json, canonical_payload,
-              result_object_id, result_version, recorded_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(key.origin_device_id.as_str())
-        .bind(key.idempotency_key.as_str())
-        .bind(serde_json::to_string(envelope)?)
-        .bind(canonical_payload)
-        .bind(&record.id)
-        .bind(record.version)
-        .bind(envelope.recorded_time.to_string())
-        .execute(&mut *transaction)
-        .await?;
+    }
+    Ok(())
+}
 
-        // Read on the transaction's connection, avoiding a second pool checkout
-        // (the store has one connection), then return only after commit succeeds.
-        get_current_state(&mut *transaction, &record.id)
-            .await?
-            .ok_or_else(|| StoreError::RecordedMutationObjectMissing { object_id: record.id.clone() })
-    }.await;
+async fn record_mutation(
+    connection: &mut SqliteConnection,
+    envelope: &MutationEnvelope,
+    canonical_payload: &str,
+    object_id: &str,
+    version: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO mutation_envelopes
+         (origin_device_id, idempotency_key, envelope_json, canonical_payload,
+          result_object_id, result_version, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(envelope.origin_device_id.as_str())
+    .bind(envelope.idempotency_key.as_str())
+    .bind(serde_json::to_string(envelope)?)
+    .bind(canonical_payload)
+    .bind(object_id)
+    .bind(version)
+    .bind(envelope.recorded_time.to_string())
+    .execute(connection)
+    .await?;
+    Ok(())
+}
 
+async fn finish_mutation<T>(transaction: Transaction<'_, Sqlite>, result: Result<T>) -> Result<T> {
     match result {
         Ok(record) => {
             transaction.commit().await?;
@@ -182,6 +189,115 @@ pub async fn admit_object(
             Err(error)
         }
     }
+}
+
+fn target_precondition(envelope: &MutationEnvelope, id: &UbuId) -> Result<VersionRef> {
+    envelope.observed_versions.get(id).copied().ok_or_else(|| {
+        StoreError::MissingTargetPrecondition {
+            object_id: id.to_string(),
+        }
+    })
+}
+
+async fn read_object_result(
+    connection: &mut SqliteConnection,
+    object_id: &str,
+) -> Result<ObjectRecord> {
+    get_current_state(connection, object_id)
+        .await?
+        .ok_or_else(|| StoreError::RecordedMutationObjectMissing {
+            object_id: object_id.to_owned(),
+        })
+}
+
+/// Private shared object writer, reachable only after envelope checks on the
+/// same transaction. Preserve existing record validation and created_at on updates.
+async fn write_object_row(
+    connection: &mut SqliteConnection,
+    envelope: &MutationEnvelope,
+    mut record: NewObjectRecord,
+) -> Result<ObjectRecord> {
+    let expected = target_precondition(envelope, &UbuId::parse(&record.id)?)?;
+    validate_object_record(&record)?;
+    let payload_json = serde_json::to_string(&record.payload)?;
+    match expected {
+        VersionRef::Absent => {
+            record.version = 1;
+            sqlx::query(
+                "INSERT INTO objects
+                 (id, object_type, version, status, compartment_label, payload_json, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&record.id)
+            .bind(&record.object_type)
+            .bind(record.version)
+            .bind(&record.status)
+            .bind(&record.compartment_label)
+            .bind(&payload_json)
+            .bind(&record.created_at)
+            .bind(&record.updated_at)
+            .execute(&mut *connection)
+            .await?;
+        }
+        VersionRef::Version(version) => {
+            record.version = i64::try_from(version)
+                .ok()
+                .and_then(|v| v.checked_add(1))
+                .ok_or_else(|| StoreError::ObjectVersionExhausted {
+                    object_id: record.id.clone(),
+                    version,
+                })?;
+            sqlx::query(
+                "UPDATE objects SET version = ?, status = ?, compartment_label = ?,
+                 payload_json = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(record.version)
+            .bind(&record.status)
+            .bind(&record.compartment_label)
+            .bind(&payload_json)
+            .bind(&record.updated_at)
+            .bind(&record.id)
+            .execute(&mut *connection)
+            .await?;
+        }
+    }
+    read_object_result(connection, &record.id).await
+}
+
+/// Admit one canonical object mutation atomically with its envelope.
+/// Device registration/trust and policy-version enforcement belong to later tickets.
+/// Replay equality is deliberately defined over `record.payload` alone. A replay
+/// reads the recorded target's current state; the ledger is not historical state.
+pub async fn admit_object(
+    pool: &SqlitePool,
+    envelope: &MutationEnvelope,
+    record: NewObjectRecord,
+) -> Result<ObjectRecord> {
+    let mut transaction = crate::transactions::begin(pool).await?;
+    let result = async {
+        let prepared = prepare_mutation(
+            &mut transaction,
+            envelope,
+            &record.payload,
+            MutationTarget::Object,
+        )
+        .await?;
+        if let Some(replay) = prepared.replay {
+            return read_object_result(&mut transaction, &replay.result_object_id).await;
+        }
+        let admitted = write_object_row(&mut transaction, envelope, record).await?;
+        record_mutation(
+            &mut transaction,
+            envelope,
+            &prepared.canonical_payload,
+            &admitted.id,
+            admitted.version,
+        )
+        .await?;
+        Ok(admitted)
+    }
+    .await;
+    finish_mutation(transaction, result).await
 }
 
 /// UBU-D0274 violation retained solely for `admit_candidate_object`: candidate
@@ -267,16 +383,19 @@ pub async fn append_log_entry(pool: &SqlitePool, record: NewLogRecord) -> Result
 }
 
 /// Look up an admission audit row by its complete device-scoped duplicate key.
-pub async fn get_recorded_mutation(
-    pool: &SqlitePool,
+pub async fn get_recorded_mutation<'e, E>(
+    executor: E,
     key: &MutationKey,
-) -> Result<Option<RecordedMutation>> {
+) -> Result<Option<RecordedMutation>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query_as::<_, RecordedMutation>(
         "SELECT * FROM mutation_envelopes WHERE origin_device_id = ? AND idempotency_key = ?",
     )
     .bind(key.origin_device_id.as_str())
     .bind(key.idempotency_key.as_str())
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
     .map_err(Into::into)
 }
@@ -311,63 +430,69 @@ where
 /// re-checked before the write.
 pub async fn persist_universe_state(
     pool: &SqlitePool,
+    envelope: &MutationEnvelope,
     state: &UniverseState,
     authority_source: AuthoritySource,
 ) -> Result<ObjectRecord> {
-    let id = state.id.to_string();
-    let current = get_current_state(pool, &id).await?.ok_or_else(|| {
-        StoreError::InvalidPayload(format!(
-            "cannot persist UniverseState `{id}`: no current version exists"
-        ))
-    })?;
-
-    // Serialize the updated container; carry the schema_version and provenance
-    // shell metadata that live alongside the canonical UniverseState payload.
-    let mut payload = serde_json::to_value(state)?;
-    let current_payload: Value = serde_json::from_str(&current.payload_json)?;
-    if let Some(schema_version) = current_payload.get("schema_version") {
-        payload["schema_version"] = schema_version.clone();
+    let mut transaction = crate::transactions::begin(pool).await?;
+    let result = async {
+        // Compare caller inputs, not regenerated timestamps or mutable database
+        // shell metadata. Identical retries remain identical after the write.
+        let request_payload =
+            serde_json::json!({"state": state, "authority_source": authority_source});
+        let prepared = prepare_mutation(
+            &mut transaction,
+            envelope,
+            &request_payload,
+            MutationTarget::Object,
+        )
+        .await?;
+        if let Some(replay) = prepared.replay {
+            return read_object_result(&mut transaction, &replay.result_object_id).await;
+        }
+        if target_precondition(envelope, &state.id)? == VersionRef::Absent {
+            return Err(StoreError::PreconditionFailed {
+                object_id: state.id.to_string(),
+                expected: "existing version".to_owned(),
+                actual: "absent".to_owned(),
+            });
+        }
+        let current = read_object_result(&mut transaction, state.id.as_str()).await?;
+        let mut payload = serde_json::to_value(state)?;
+        let current_payload: Value = serde_json::from_str(&current.payload_json)?;
+        if let Some(schema_version) = current_payload.get("schema_version") {
+            payload["schema_version"] = schema_version.clone();
+        }
+        payload["provenance"] = serde_json::to_value(Provenance {
+            created_at: envelope.created_time,
+            created_by: None,
+            authority_source,
+            source: None,
+            source_refs: None,
+        })?;
+        let record = NewObjectRecord {
+            id: state.id.to_string(),
+            object_type: ObjectType::UniverseState.as_str().to_owned(),
+            version: current.version,
+            status: current.status,
+            compartment_label: current.compartment_label,
+            payload,
+            created_at: current.created_at,
+            updated_at: envelope.recorded_time.to_string(),
+        };
+        let admitted = write_object_row(&mut transaction, envelope, record).await?;
+        record_mutation(
+            &mut transaction,
+            envelope,
+            &prepared.canonical_payload,
+            &admitted.id,
+            admitted.version,
+        )
+        .await?;
+        Ok(admitted)
     }
-    let now = UbuTimestamp::now_utc();
-    payload["provenance"] = serde_json::to_value(Provenance {
-        created_at: now,
-        created_by: None,
-        authority_source,
-        source: None,
-        source_refs: None,
-    })?;
-
-    let now = now.to_string();
-    let record = NewObjectRecord {
-        id: id.clone(),
-        object_type: ObjectType::UniverseState.as_str().to_owned(),
-        version: current.version + 1,
-        status: current.status.clone(),
-        compartment_label: current.compartment_label.clone(),
-        payload,
-        created_at: current.created_at.clone(),
-        updated_at: now,
-    };
-    validate_object_record(&record)?;
-    let payload_json = serde_json::to_string(&record.payload)?;
-
-    sqlx::query(
-        "UPDATE objects
-        SET version = ?, status = ?, compartment_label = ?, payload_json = ?, updated_at = ?
-        WHERE id = ?",
-    )
-    .bind(record.version)
-    .bind(&record.status)
-    .bind(&record.compartment_label)
-    .bind(&payload_json)
-    .bind(&record.updated_at)
-    .bind(&record.id)
-    .execute(pool)
-    .await?;
-
-    Ok(get_current_state(pool, &id)
-        .await?
-        .expect("updated object is readable"))
+    .await;
+    finish_mutation(transaction, result).await
 }
 
 pub async fn get_object_history(pool: &SqlitePool, object_id: &str) -> Result<Vec<LogRecord>> {
