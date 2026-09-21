@@ -1,14 +1,11 @@
-use std::collections::HashSet;
-
 use serde_json::{Map, Value};
-use ubu_core::core::TaskStatus;
+use ubu_core::core::{TaskCorrelationGroup, TaskDurationEstimate, TaskStatus};
 use ubu_core::id_registry::ObjectType;
 use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
 
 use crate::compartment_gate::validate_compartment_label;
 use crate::errors::{Result, StoreError};
 use crate::models::object_record::NewObjectRecord;
-use crate::models::task_record::{TaskCorrelationGroup, TaskDurationEstimate};
 use crate::provenance_gate::validate_provenance_value;
 
 pub fn object_type_from_str(value: &str) -> Result<ObjectType> {
@@ -138,19 +135,7 @@ fn validate_task_estimate_fields(
 
     if let Some(value) = payload.get("correlation_groups") {
         let groups: Vec<TaskCorrelationGroup> = serde_json::from_value(value.clone())?;
-        let mut names = HashSet::with_capacity(groups.len());
-        for group in groups {
-            if !(0.0..=1.0).contains(&group.strength) {
-                return Err(invalid_payload(
-                    "core/task schema: correlation group strength must be between zero and one",
-                ));
-            }
-            if !names.insert(group.group) {
-                return Err(invalid_payload(
-                    "core/task schema: correlation group names must be unique",
-                ));
-            }
-        }
+        TaskCorrelationGroup::validate_groups(&groups)?;
     }
 
     Ok(())
