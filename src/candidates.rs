@@ -5,7 +5,7 @@ use serde_json::json;
 use sqlx::{SqliteConnection, SqlitePool};
 use ubu_core::{
     transition, AdvisoryCandidate, AdvisoryCandidateId, CandidateLifecycleState, MutationEnvelope,
-    ResurfaceTrigger, SuppressionDecision, SuppressionRecord,
+    ResurfaceTrigger, RetentionPolicy, SuppressionDecision, SuppressionRecord,
 };
 
 use crate::errors::{Result, StoreError};
@@ -229,41 +229,61 @@ pub async fn transition_advisory_candidate(
 }
 
 /// Reject atomically with a suppression record and a first-class decision event.
-/// Suppression's actor/authority/decision time must agree with the envelope.
+/// Only caller-owned rejection inputs; provenance is taken from the envelope.
+#[derive(Debug, Clone, Serialize)]
+pub struct RejectionInput {
+    pub rejection_reason_or_user_correction: String,
+    pub retention_policy: RetentionPolicy,
+    pub evidence_hashes_or_source_fingerprints: Vec<String>,
+    pub suppression_key: Option<String>,
+}
+
+/// Build the durable suppression record inside the rejection transaction.
 pub async fn reject_advisory_candidate(
     pool: &SqlitePool,
     envelope: &MutationEnvelope,
     id: &AdvisoryCandidateId,
     observed_version: u64,
-    suppression: SuppressionRecord,
+    input: RejectionInput,
 ) -> Result<CandidateRecord> {
     let mut transaction = crate::transactions::begin(pool).await?;
     let result = async {
         let payload = json!({"operation": "reject_advisory_candidate", "id": id,
-            "observed_version": observed_version, "suppression": suppression});
+            "observed_version": observed_version, "input": input});
         let prepared = prepare_mutation(&mut transaction, envelope, &payload, MutationTarget::Candidate).await?;
         if let Some(replay) = prepared.replay {
             return read_candidate(&mut transaction, &replay.result_object_id).await;
         }
         let mut candidate = observed_candidate(&mut transaction, id, observed_version).await?;
         transition(candidate.lifecycle_state, CandidateLifecycleState::Rejected, None)?;
-        suppression.validate()?;
         // A proposal may acquire its suppression key at rejection, but an existing
         // key must not silently change. All remaining shape/provenance is retained.
+        if let (Some(existing), Some(supplied)) = (&candidate.suppression_key, &input.suppression_key) {
+            if existing != supplied {
+                return Err(StoreError::SuppressionKeyConflict);
+            }
+        }
         if candidate.suppression_key.is_none() {
-            candidate.suppression_key = Some(suppression.suppression_key.clone());
+            candidate.suppression_key = Some(input.suppression_key.clone().unwrap_or_else(|| {
+                let identity = json!({
+                    "candidate_kind": candidate.candidate_kind,
+                    "normalized_proposal": candidate.normalized_proposal,
+                    "target_refs": candidate.target_refs,
+                });
+                String::from_utf8(ubu_core::canonical_payload_bytes(&identity))
+                    .expect("canonical JSON is UTF-8")
+            }));
         }
         let mut rejected = candidate.clone();
         rejected.lifecycle_state = CandidateLifecycleState::Rejected;
-        let expected = rejected.suppression_record(SuppressionDecision {
+        let suppression = rejected.suppression_record(SuppressionDecision {
             deciding_actor_identity_id: envelope.actor_identity_id.clone(),
             authority_source: envelope.authority_source,
             decided_at: envelope.effective_time,
-            rejection_reason_or_user_correction: suppression.rejection_reason_or_user_correction.clone(),
-            retention_policy: suppression.retention_policy,
-            evidence_hashes_or_source_fingerprints: suppression.evidence_hashes_or_source_fingerprints.clone(),
+            rejection_reason_or_user_correction: input.rejection_reason_or_user_correction,
+            retention_policy: input.retention_policy,
+            evidence_hashes_or_source_fingerprints: input.evidence_hashes_or_source_fingerprints,
         })?;
-        if expected != suppression { return Err(StoreError::SuppressionMismatch); }
         sqlx::query("INSERT INTO suppression_records (suppression_key, advisory_candidate_id, payload_json, decided_at)
             VALUES (?, ?, ?, ?)")
             .bind(&suppression.suppression_key).bind(id.as_str())

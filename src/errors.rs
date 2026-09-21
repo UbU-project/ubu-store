@@ -13,8 +13,8 @@ pub enum StoreError {
     #[error("transition to {state:?} requires its dedicated candidate writer")]
     DedicatedCandidateWriterRequired { state: ubu_core::CandidateLifecycleState },
 
-    #[error("suppression record does not match candidate and decision provenance")]
-    SuppressionMismatch,
+    #[error("supplied suppression key conflicts with the candidate's existing key")]
+    SuppressionKeyConflict,
 
     #[error("precondition failed for `{object_id}`: expected {expected}, actual {actual}")]
     PreconditionFailed {
