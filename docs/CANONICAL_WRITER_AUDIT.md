@@ -20,7 +20,7 @@ pub async fn append_log_entry(pool: &SqlitePool, envelope: &MutationEnvelope, re
 pub async fn store_external_reference(pool: &SqlitePool, envelope: &MutationEnvelope, record: NewExternalReferenceRecord) -> Result<ExternalReferenceRecord>;
 pub async fn store_advisory_candidate(pool: &SqlitePool, envelope: &MutationEnvelope, candidate: AdvisoryCandidate) -> Result<CandidateRecord>;
 pub async fn transition_advisory_candidate(pool: &SqlitePool, envelope: &MutationEnvelope, id: &AdvisoryCandidateId, observed_version: u64, next_state: CandidateLifecycleState, trigger: Option<ResurfaceTrigger>) -> Result<CandidateRecord>;
-pub async fn reject_advisory_candidate(pool: &SqlitePool, envelope: &MutationEnvelope, id: &AdvisoryCandidateId, observed_version: u64, suppression: SuppressionRecord) -> Result<CandidateRecord>;
+pub async fn reject_advisory_candidate(pool: &SqlitePool, envelope: &MutationEnvelope, id: &AdvisoryCandidateId, observed_version: u64, input: RejectionInput) -> Result<CandidateRecord>;
 pub async fn admit_advisory_candidate(pool: &SqlitePool, envelope: &MutationEnvelope, id: &AdvisoryCandidateId, observed_version: u64, record: NewObjectRecord) -> Result<(CandidateRecord, ObjectRecord)>;
 pub async fn store_plan(pool: &SqlitePool, record: NewPlanRecord) -> Result<PlanRecord>;
 pub async fn store_calendar(pool: &SqlitePool, record: NewCalendarRecord) -> Result<CalendarRecord>;
@@ -100,12 +100,20 @@ rg -n 'SELECT|JOIN' src/queries.rs src/replay.rs src/recalculation.rs src/api
   replacement input; no such content is fabricated. Suppression is linked via the
   event's candidate id and that candidate's suppression key; the exact supplied
   migration has no separate suppression/replacement columns on decision events.
-- Rejection validates suppression metadata against the candidate and envelope:
-  actor and authority match; decided_at is effective_time, with recorded_time
-  independently retained on the event. A missing candidate suppression key may be
-  assigned from the rejection input; an existing key must match. Hashes/reason/
-  retention are caller inputs validated by core's suppression builder. Duplicate
-  suppression keys fail rather than overwrite durable correction metadata.
+- Rejection builds suppression metadata from the candidate and envelope:
+  actor and authority come from the envelope; decided_at is effective_time, with
+  recorded_time independently retained on the event. RejectionInput contains only
+  rejection_reason_or_user_correction, retention_policy,
+  evidence_hashes_or_source_fingerprints and optional suppression_key.
+  Key precedence is existing candidate key, supplied key, then compact canonical
+  JSON of candidate_kind, normalized_proposal and target_refs. Object keys are
+  recursively sorted; array order is preserved. Conflicting supplied/existing keys
+  fail with SuppressionKeyConflict and no writes. Core's suppression builder
+  validates caller inputs after a clone is marked Rejected. The caller never
+  supplies a finished record; SuppressionMismatch no longer exists. Duplicate
+  suppression keys still fail rather than overwrite durable correction metadata.
+  Replay checks operation/id/version/input before inspecting current candidate
+  state, so the same MutationKey and request remain a no-op after rejection.
 - review_queue includes only Proposed/Resurfaced, ordered by review_order (SQLite
   NULLs first), then created_at and candidate id for deterministic ties. Events
   are ordered by observed version, independent of timestamp ordering.

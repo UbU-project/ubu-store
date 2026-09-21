@@ -4,12 +4,12 @@ use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use ubu_core::{
     AdvisoryCandidate, AdvisoryCandidateId, CandidateLifecycleState as State, MutationEnvelope,
-    ObjectType, ResurfaceTrigger as Trigger, RetentionPolicy, SuppressionDecision,
-    SuppressionRecord, UbuError, UbuId, UbuTimestamp, VersionRef,
+    ObjectType, ResurfaceTrigger as Trigger, RetentionPolicy, SuppressionDecision, UbuError, UbuId,
+    UbuTimestamp, VersionRef,
 };
 use ubu_store::api::admission::{
     admit_advisory_candidate, reject_advisory_candidate, store_advisory_candidate,
-    transition_advisory_candidate,
+    transition_advisory_candidate, RejectionInput,
 };
 use ubu_store::api::review::{
     find_suppression_record, get_advisory_candidate, list_candidate_decision_events, review_queue,
@@ -43,19 +43,13 @@ async fn setup() -> (UbuStore, AdvisoryCandidate, NewObjectRecord) {
     (store, candidate, record)
 }
 
-fn suppression(candidate: &AdvisoryCandidate, envelope: &MutationEnvelope) -> SuppressionRecord {
-    let mut rejected = candidate.clone();
-    rejected.lifecycle_state = State::Rejected;
-    rejected
-        .suppression_record(SuppressionDecision {
-            deciding_actor_identity_id: envelope.actor_identity_id.clone(),
-            authority_source: envelope.authority_source,
-            decided_at: envelope.effective_time,
-            rejection_reason_or_user_correction: "Do not infer this tag.".into(),
-            retention_policy: RetentionPolicy::PurgePayload,
-            evidence_hashes_or_source_fingerprints: vec!["source-fingerprint:task:v1".into()],
-        })
-        .unwrap()
+fn rejection_input() -> RejectionInput {
+    RejectionInput {
+        rejection_reason_or_user_correction: "Do not infer this tag.".into(),
+        retention_policy: RetentionPolicy::PurgePayload,
+        evidence_hashes_or_source_fingerprints: vec!["source-fingerprint:task:v1".into()],
+        suppression_key: None,
+    }
 }
 
 async fn snapshot(pool: &SqlitePool) -> Value {
@@ -398,8 +392,22 @@ async fn rejection_records_suppression_and_decision_without_canonical_state() {
     let (store, candidate, object) = setup().await;
     let id = &candidate.advisory_candidate_id;
     let envelope = common::append_envelope();
-    let suppression = suppression(&candidate, &envelope);
-    let rejected = reject_advisory_candidate(store.pool(), &envelope, id, 1, suppression.clone())
+    let input = rejection_input();
+    let mut expected_candidate = candidate.clone();
+    expected_candidate.lifecycle_state = State::Rejected;
+    let suppression = expected_candidate
+        .suppression_record(SuppressionDecision {
+            deciding_actor_identity_id: envelope.actor_identity_id.clone(),
+            authority_source: envelope.authority_source,
+            decided_at: envelope.effective_time,
+            rejection_reason_or_user_correction: input.rejection_reason_or_user_correction.clone(),
+            retention_policy: input.retention_policy,
+            evidence_hashes_or_source_fingerprints: input
+                .evidence_hashes_or_source_fingerprints
+                .clone(),
+        })
+        .unwrap();
+    let rejected = reject_advisory_candidate(store.pool(), &envelope, id, 1, input.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -432,12 +440,111 @@ async fn rejection_records_suppression_and_decision_without_canonical_state() {
     );
     let before = snapshot(store.pool()).await;
     assert_eq!(
-        reject_advisory_candidate(store.pool(), &envelope, id, 1, suppression)
+        reject_advisory_candidate(store.pool(), &envelope, id, 1, input)
             .await
             .unwrap(),
         rejected
     );
     assert_eq!(snapshot(store.pool()).await, before);
+}
+
+async fn reject_without_key(mut candidate: AdvisoryCandidate) -> String {
+    let store = UbuStore::in_memory().await.unwrap();
+    candidate.suppression_key = None;
+    store_advisory_candidate(store.pool(), &common::append_envelope(), candidate.clone())
+        .await
+        .unwrap();
+    let envelope = common::append_envelope();
+    let input = rejection_input();
+    let rejected = reject_advisory_candidate(
+        store.pool(),
+        &envelope,
+        &candidate.advisory_candidate_id,
+        1,
+        input.clone(),
+    )
+    .await
+    .unwrap();
+    let key = rejected.suppression_key.clone().unwrap();
+    let expected_key = String::from_utf8(ubu_core::canonical_payload_bytes(&json!({
+        "candidate_kind": candidate.candidate_kind,
+        "normalized_proposal": candidate.normalized_proposal,
+        "target_refs": candidate.target_refs,
+    })))
+    .unwrap();
+    assert_eq!(key, expected_key);
+    let expected = rejected
+        .candidate()
+        .unwrap()
+        .suppression_record(SuppressionDecision {
+            deciding_actor_identity_id: envelope.actor_identity_id.clone(),
+            authority_source: envelope.authority_source,
+            decided_at: envelope.effective_time,
+            rejection_reason_or_user_correction: input.rejection_reason_or_user_correction.clone(),
+            retention_policy: input.retention_policy,
+            evidence_hashes_or_source_fingerprints: input
+                .evidence_hashes_or_source_fingerprints
+                .clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        find_suppression_record(store.pool(), &key).await.unwrap(),
+        Some(expected)
+    );
+    assert_eq!(canonical_counts(store.pool()).await, vec![0; 9]);
+    let before = snapshot(store.pool()).await;
+    assert_eq!(
+        reject_advisory_candidate(
+            store.pool(),
+            &envelope,
+            &candidate.advisory_candidate_id,
+            1,
+            input,
+        )
+        .await
+        .unwrap(),
+        rejected
+    );
+    assert_eq!(snapshot(store.pool()).await, before);
+    key
+}
+
+#[tokio::test]
+async fn proposed_candidates_derive_deterministic_target_scoped_keys() {
+    let object = task();
+    let first = common::candidate_for(&object);
+    let mut second = common::candidate_for(&object);
+    // Object member order is not part of proposal identity.
+    second.normalized_proposal =
+        serde_json::from_str(r#"{"tag":"focus","operation":"add_tag"}"#).unwrap();
+    let key = reject_without_key(first).await;
+    assert_eq!(key, reject_without_key(second).await);
+    let different_target = common::candidate_for(&task());
+    assert_ne!(key, reject_without_key(different_target).await);
+}
+
+#[tokio::test]
+async fn rejection_key_precedence_keeps_existing_or_accepts_supplied() {
+    for existing in [None, Some("existing-key".to_owned())] {
+        let store = UbuStore::in_memory().await.unwrap();
+        let mut candidate = common::candidate_for(&task());
+        candidate.suppression_key = existing.clone();
+        store_advisory_candidate(store.pool(), &common::append_envelope(), candidate.clone())
+            .await
+            .unwrap();
+        let mut input = rejection_input();
+        input.suppression_key = Some(existing.clone().unwrap_or_else(|| "caller-key".into()));
+        let rejected = reject_advisory_candidate(
+            store.pool(),
+            &common::append_envelope(),
+            &candidate.advisory_candidate_id,
+            1,
+            input.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected.suppression_key, input.suppression_key);
+    }
 }
 
 #[tokio::test]
@@ -601,7 +708,7 @@ async fn queue_excludes_inactive_states_and_orders_by_order_then_creation_time()
             }
             State::Rejected => {
                 let env = common::append_envelope();
-                reject_advisory_candidate(store.pool(), &env, id, 1, suppression(&candidate, &env))
+                reject_advisory_candidate(store.pool(), &env, id, 1, rejection_input())
                     .await
                     .unwrap();
             }
@@ -837,7 +944,7 @@ async fn decision_insert_failure_rolls_back_canonical_object_and_ledger() {
         &env,
         &candidate.advisory_candidate_id,
         1,
-        suppression(&candidate, &env)
+        rejection_input()
     )
     .await
     .is_err());
@@ -874,7 +981,7 @@ async fn ledger_failure_rolls_back_all_four_candidate_writers() {
         &env,
         &candidate.advisory_candidate_id,
         1,
-        suppression(&candidate, &env)
+        rejection_input()
     )
     .await
     .is_err());
@@ -892,32 +999,25 @@ async fn ledger_failure_rolls_back_all_four_candidate_writers() {
 }
 
 #[tokio::test]
-async fn suppression_mismatch_duplicate_key_and_changed_replay_cannot_overwrite_corrections() {
+async fn conflicting_key_duplicate_key_and_changed_replay_cannot_overwrite_corrections() {
     let (store, candidate, _) = setup().await;
     let env = common::append_envelope();
-    let original = suppression(&candidate, &env);
+    let original = rejection_input();
     let before = snapshot(store.pool()).await;
-    for field in ["actor", "shape", "key", "time"] {
-        let mut invalid = original.clone();
-        match field {
-            "actor" => invalid.deciding_actor_identity_id = UbuId::new(ObjectType::Identity),
-            "shape" => invalid.normalized_proposal = json!({"different": true}),
-            "key" => invalid.suppression_key = "unrelated".into(),
-            _ => invalid.decided_at = UbuTimestamp::parse("2026-09-20T09:00:00Z").unwrap(),
-        }
-        assert!(matches!(
-            reject_advisory_candidate(
-                store.pool(),
-                &env,
-                &candidate.advisory_candidate_id,
-                1,
-                invalid
-            )
-            .await,
-            Err(StoreError::SuppressionMismatch)
-        ));
-        assert_eq!(snapshot(store.pool()).await, before);
-    }
+    let mut invalid = original.clone();
+    invalid.suppression_key = Some("unrelated".into());
+    assert!(matches!(
+        reject_advisory_candidate(
+            store.pool(),
+            &env,
+            &candidate.advisory_candidate_id,
+            1,
+            invalid
+        )
+        .await,
+        Err(StoreError::SuppressionKeyConflict)
+    ));
+    assert_eq!(snapshot(store.pool()).await, before);
     reject_advisory_candidate(
         store.pool(),
         &env,
@@ -954,7 +1054,7 @@ async fn suppression_mismatch_duplicate_key_and_changed_replay_cannot_overwrite_
         &env,
         &other.advisory_candidate_id,
         1,
-        suppression(&other, &env)
+        rejection_input()
     )
     .await
     .is_err());
