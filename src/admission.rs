@@ -1,5 +1,7 @@
 use serde_json::{Map, Value};
-use ubu_core::core::{TaskCorrelationGroup, TaskDurationEstimate, TaskStatus};
+use ubu_core::core::{
+    validate_category_tag, StaticWindow, TaskCorrelationGroup, TaskDurationEstimate, TaskStatus,
+};
 use ubu_core::id_registry::ObjectType;
 use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
 
@@ -112,7 +114,7 @@ fn validate_canonical_object_payload(record: &NewObjectRecord) -> Result<()> {
 
     let object_type = object_type_from_str(&record.object_type)?;
     validate_payload_lifecycle_status(record, payload)?;
-    validate_task_estimate_fields(object_type, payload)?;
+    validate_task_fields(object_type, payload)?;
     validate_payload_provenance(object_type, payload)?;
     validate_payload_authority_source(object_type, payload)?;
     validate_payload_compartment_metadata(object_type, payload)?;
@@ -120,7 +122,7 @@ fn validate_canonical_object_payload(record: &NewObjectRecord) -> Result<()> {
     Ok(())
 }
 
-fn validate_task_estimate_fields(
+fn validate_task_fields(
     object_type: ObjectType,
     payload: &Map<String, Value>,
 ) -> Result<()> {
@@ -136,6 +138,25 @@ fn validate_task_estimate_fields(
     if let Some(value) = payload.get("correlation_groups") {
         let groups: Vec<TaskCorrelationGroup> = serde_json::from_value(value.clone())?;
         TaskCorrelationGroup::validate_groups(&groups)?;
+    }
+
+    if let Some(value) = payload.get("category_tag") {
+        let category_tag: String = serde_json::from_value(value.clone())?;
+        let tags: Vec<String> = payload
+            .get("tags")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        validate_category_tag(&category_tag, &tags)?;
+    }
+
+    if let Some(value) = payload.get("occupies_capacity") {
+        serde_json::from_value::<bool>(value.clone())?;
+    }
+
+    if let Some(value) = payload.get("static_window") {
+        let window: StaticWindow = serde_json::from_value(value.clone())?;
+        window.validate()?;
     }
 
     Ok(())
