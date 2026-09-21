@@ -2,9 +2,9 @@ mod common;
 
 use serde_json::{json, Value};
 use ubu_core::id_registry::ObjectType;
-use ubu_core::UbuId;
+use ubu_core::{CorrelationGroupViolation, DurationEstimateViolation, UbuError, UbuId};
 use ubu_store::models::object_record::NewObjectRecord;
-use ubu_store::{queries, UbuStore};
+use ubu_store::{queries, StoreError, UbuStore};
 
 fn task_record(payload_fields: Value) -> NewObjectRecord {
     let id = UbuId::new(ObjectType::Task).to_string();
@@ -112,4 +112,115 @@ async fn rejects_invalid_three_point_duration_ordering() {
         .await
         .expect_err("invalid ordering is rejected");
     assert!(error.to_string().contains("min_seconds < mode_seconds"));
+    assert!(matches!(
+        error,
+        StoreError::Core(UbuError::InvalidTaskDurationEstimate {
+            violation: DurationEstimateViolation::NotStrictlyIncreasing,
+        })
+    ));
+}
+
+async fn rejected(fields: Value) -> StoreError {
+    let store = UbuStore::in_memory().await.unwrap();
+    let record = task_record(fields);
+    let id = record.id.clone();
+    let error = common::admit_object(store.pool(), record)
+        .await
+        .unwrap_err();
+    assert!(queries::get_current_state(store.pool(), &id)
+        .await
+        .unwrap()
+        .is_none());
+    error
+}
+
+#[tokio::test]
+async fn rejects_zero_seconds_with_core_violation() {
+    let error = rejected(json!({"duration_estimate": {"type": "fixed", "seconds": 0}})).await;
+    assert!(error
+        .to_string()
+        .contains("seconds must be greater than zero"));
+    assert!(matches!(
+        error,
+        StoreError::Core(UbuError::InvalidTaskDurationEstimate {
+            violation: DurationEstimateViolation::ZeroSeconds,
+        })
+    ));
+}
+
+#[tokio::test]
+async fn rejects_each_non_increasing_duration_with_core_violation() {
+    for (min, mode, p95) in [(10, 10, 20), (11, 10, 20), (0, 10, 10), (0, 11, 10)] {
+        let error = rejected(json!({"duration_estimate": {
+            "type": "shifted_lognormal_p95", "min_seconds": min,
+            "mode_seconds": mode, "p95_seconds": p95,
+        }}))
+        .await;
+        assert!(matches!(
+            error,
+            StoreError::Core(UbuError::InvalidTaskDurationEstimate {
+                violation: DurationEstimateViolation::NotStrictlyIncreasing,
+            })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn rejects_unknown_fields_through_core_types_serde_contract() {
+    // Unknown fields remain serde errors, distinct from semantic core violations.
+    for fields in [
+        json!({"duration_estimate": {"type": "fixed", "seconds": 1, "unexpected": true}}),
+        json!({"duration_estimate": {"type": "shifted_lognormal_p95", "min_seconds": 0,
+            "mode_seconds": 1, "p95_seconds": 2, "unexpected": true}}),
+        json!({"correlation_groups": [{"group": "g", "strength": 0.5, "unexpected": true}]}),
+    ] {
+        match rejected(fields).await {
+            StoreError::Json(error) => {
+                assert!(error.to_string().contains("unknown field `unexpected`"))
+            }
+            error => panic!("expected serde unknown-field error, got {error:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejects_correlation_strength_and_duplicate_names_with_core_violations() {
+    for strength in [-0.1, 1.1] {
+        let error =
+            rejected(json!({"correlation_groups": [{"group": "g", "strength": strength}]})).await;
+        assert!(error
+            .to_string()
+            .contains("strength must be between zero and one"));
+        assert!(matches!(
+            error,
+            StoreError::Core(UbuError::InvalidTaskCorrelationGroup {
+                violation: CorrelationGroupViolation::StrengthOutOfRange,
+            })
+        ));
+    }
+    let error = rejected(json!({"correlation_groups": [
+        {"group": "g", "strength": 0.0}, {"group": "g", "strength": 1.0},
+    ]}))
+    .await;
+    assert!(error.to_string().contains("names must be unique"));
+    assert!(matches!(
+        error,
+        StoreError::Core(UbuError::InvalidTaskCorrelationGroup {
+            violation: CorrelationGroupViolation::DuplicateName,
+        })
+    ));
+}
+
+#[tokio::test]
+async fn accepts_duration_and_correlation_boundary_values() {
+    for fields in [
+        json!({"duration_estimate": {"type": "fixed", "seconds": 1}}),
+        json!({"duration_estimate": {"type": "fixed", "seconds": u64::MAX}}),
+        json!({"duration_estimate": {"type": "shifted_lognormal_p95", "min_seconds": 0,
+            "mode_seconds": 1, "p95_seconds": 2}}),
+        json!({"correlation_groups": []}),
+        json!({"correlation_groups": [{"group": "", "strength": 0.0}, {"group": "g", "strength": 1.0}]}),
+    ] {
+        admit_and_query(task_record(fields)).await;
+    }
 }
