@@ -117,6 +117,7 @@ fn validate_canonical_object_payload(record: &NewObjectRecord) -> Result<()> {
     let object_type = object_type_from_str(&record.object_type)?;
     validate_payload_lifecycle_status(record, payload)?;
     validate_task_fields(object_type, payload)?;
+    validate_objective_fields(object_type, payload)?;
     validate_payload_provenance(object_type, payload)?;
     if object_type == ObjectType::Preference {
         let preference: Preference = serde_json::from_value(record.payload.clone())?;
@@ -128,9 +129,52 @@ fn validate_canonical_object_payload(record: &NewObjectRecord) -> Result<()> {
     Ok(())
 }
 
+fn validate_objective_fields(object_type: ObjectType, payload: &Map<String, Value>) -> Result<()> {
+    use ubu_core::core::{
+        validate_objective_routine_fields, ObjectiveMode, RecurrenceSchedule,
+        RoutineInstanceTemplate,
+    };
+    if object_type != ObjectType::Objective {
+        return Ok(());
+    }
+    let mode: ObjectiveMode = payload
+        .get("mode")
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let recurrence: Option<RecurrenceSchedule> = payload
+        .get("recurrence")
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()?;
+    let template: Option<RoutineInstanceTemplate> = payload
+        .get("routine_instance_template")
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()?;
+    if let Some(schedule) = &recurrence {
+        schedule.validate()?;
+    }
+    if let Some(template) = &template {
+        template.validate()?;
+    }
+    let id: UbuId = serde_json::from_value(payload["id"].clone())?;
+    validate_objective_routine_fields(
+        &id,
+        mode,
+        recurrence.as_ref(),
+        template.as_ref(),
+        payload.contains_key("priority"),
+    )?;
+    Ok(())
+}
+
 fn validate_task_fields(object_type: ObjectType, payload: &Map<String, Value>) -> Result<()> {
     if object_type != ObjectType::Task {
         return Ok(());
+    }
+
+    if let Some(value) = payload.get("occurrence") {
+        let occurrence: ubu_core::core::TaskOccurrence = serde_json::from_value(value.clone())?;
+        occurrence.validate()?;
     }
 
     if let Some(value) = payload.get("duration_estimate") {

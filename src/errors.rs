@@ -4,14 +4,20 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("occurrence key `{key}` is already held by another Task")]
+    DuplicateOccurrenceKey { key: String },
     #[error("advisory candidate `{id}` does not exist")]
     CandidateMissing { id: String },
 
     #[error("candidate must initially be Proposed, got {state:?}")]
-    InvalidInitialCandidateState { state: ubu_core::CandidateLifecycleState },
+    InvalidInitialCandidateState {
+        state: ubu_core::CandidateLifecycleState,
+    },
 
     #[error("transition to {state:?} requires its dedicated candidate writer")]
-    DedicatedCandidateWriterRequired { state: ubu_core::CandidateLifecycleState },
+    DedicatedCandidateWriterRequired {
+        state: ubu_core::CandidateLifecycleState,
+    },
 
     #[error("supplied suppression key conflicts with the candidate's existing key")]
     SuppressionKeyConflict,

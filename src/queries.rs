@@ -23,9 +23,7 @@ use serde_json::Value;
 use sqlx::{Executor, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use ubu_core::core::UniverseState;
 use ubu_core::id_registry::ObjectType;
-use ubu_core::store::{
-    canonical_payload_bytes, MutationEnvelope, MutationKey, VersionRef,
-};
+use ubu_core::store::{canonical_payload_bytes, MutationEnvelope, MutationKey, VersionRef};
 use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
 
 use crate::admission::{
@@ -73,8 +71,10 @@ impl MutationTarget {
     fn accepts(self, recorded: &RecordedMutation) -> bool {
         match self {
             Self::Object => recorded.result_version > 0,
-            Self::Candidate => recorded.result_version < 0
-                && ubu_core::AdvisoryCandidateId::parse(&recorded.result_object_id).is_ok(),
+            Self::Candidate => {
+                recorded.result_version < 0
+                    && ubu_core::AdvisoryCandidateId::parse(&recorded.result_object_id).is_ok()
+            }
             Self::Log | Self::ExternalReference => {
                 let expected = match self {
                     Self::Log => ObjectType::LogEntry,
@@ -186,7 +186,10 @@ pub(crate) async fn record_mutation(
     Ok(())
 }
 
-pub(crate) async fn finish_mutation<T>(transaction: Transaction<'_, Sqlite>, result: Result<T>) -> Result<T> {
+pub(crate) async fn finish_mutation<T>(
+    transaction: Transaction<'_, Sqlite>,
+    result: Result<T>,
+) -> Result<T> {
     match result {
         Ok(record) => {
             transaction.commit().await?;
@@ -227,6 +230,21 @@ async fn write_object_row(
 ) -> Result<ObjectRecord> {
     let expected = target_precondition(envelope, &UbuId::parse(&record.id)?)?;
     validate_object_record(&record)?;
+    if record.object_type == "Task" {
+        if let Some(key) = record
+            .payload
+            .pointer("/occurrence/key")
+            .and_then(serde_json::Value::as_str)
+        {
+            let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM objects WHERE object_type = 'Task' AND json_extract(payload_json, '$.occurrence.key') = ? AND id <> ?)")
+                .bind(key).bind(&record.id).fetch_one(&mut *connection).await?;
+            if held {
+                return Err(StoreError::DuplicateOccurrenceKey {
+                    key: key.to_owned(),
+                });
+            }
+        }
+    }
     let payload_json = serde_json::to_string(&record.payload)?;
     match expected {
         VersionRef::Absent => {
@@ -310,8 +328,13 @@ pub(crate) async fn admit_prepared_object(
     }
     let admitted = write_object_row(connection, envelope, record).await?;
     record_mutation(
-        connection, envelope, &prepared.canonical_payload, &admitted.id, admitted.version,
-    ).await?;
+        connection,
+        envelope,
+        &prepared.canonical_payload,
+        &admitted.id,
+        admitted.version,
+    )
+    .await?;
     Ok(admitted)
 }
 
@@ -390,13 +413,12 @@ pub async fn get_recorded_mutation<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    Ok(lookup_mutation(executor, key).await?.filter(|row| row.result_version >= 0))
+    Ok(lookup_mutation(executor, key)
+        .await?
+        .filter(|row| row.result_version >= 0))
 }
 
-async fn lookup_mutation<'e, E>(
-    executor: E,
-    key: &MutationKey,
-) -> Result<Option<RecordedMutation>>
+async fn lookup_mutation<'e, E>(executor: E, key: &MutationKey) -> Result<Option<RecordedMutation>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
