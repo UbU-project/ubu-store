@@ -1,6 +1,7 @@
 use serde_json::{Map, Value};
 use ubu_core::core::{
-    validate_category_tag, StaticWindow, TaskCorrelationGroup, TaskDurationEstimate, TaskStatus,
+    validate_category_tag, validate_scheduling_forms, AllowedTimeRange, Preference, StaticWindow,
+    TaskCorrelationGroup, TaskDurationEstimate, TaskStatus,
 };
 use ubu_core::id_registry::ObjectType;
 use ubu_core::{AuthoritySource, Provenance, UbuId, UbuTimestamp};
@@ -28,6 +29,7 @@ pub fn object_type_from_str(value: &str) -> Result<ObjectType> {
         "Identity" => Ok(ObjectType::Identity),
         "Relationship" => Ok(ObjectType::Relationship),
         "ExternalEvent" => Ok(ObjectType::ExternalEvent),
+        "Setting" => Ok(ObjectType::Setting),
         other => Err(StoreError::UnknownObjectType(other.to_owned())),
     }
 }
@@ -116,16 +118,17 @@ fn validate_canonical_object_payload(record: &NewObjectRecord) -> Result<()> {
     validate_payload_lifecycle_status(record, payload)?;
     validate_task_fields(object_type, payload)?;
     validate_payload_provenance(object_type, payload)?;
+    if object_type == ObjectType::Preference {
+        let preference: Preference = serde_json::from_value(record.payload.clone())?;
+        preference.validate()?;
+    }
     validate_payload_authority_source(object_type, payload)?;
     validate_payload_compartment_metadata(object_type, payload)?;
 
     Ok(())
 }
 
-fn validate_task_fields(
-    object_type: ObjectType,
-    payload: &Map<String, Value>,
-) -> Result<()> {
+fn validate_task_fields(object_type: ObjectType, payload: &Map<String, Value>) -> Result<()> {
     if object_type != ObjectType::Task {
         return Ok(());
     }
@@ -152,6 +155,15 @@ fn validate_task_fields(
 
     if let Some(value) = payload.get("occupies_capacity") {
         serde_json::from_value::<bool>(value.clone())?;
+    }
+
+    validate_scheduling_forms(
+        payload.contains_key("static_window"),
+        payload.contains_key("allowed_time_range"),
+    )?;
+    if let Some(value) = payload.get("allowed_time_range") {
+        let range: AllowedTimeRange = serde_json::from_value(value.clone())?;
+        range.validate()?;
     }
 
     if let Some(value) = payload.get("static_window") {
@@ -194,6 +206,7 @@ fn validate_payload_provenance(
             | ObjectType::Objective
             | ObjectType::ExternalReference
             | ObjectType::UniverseState
+            | ObjectType::Preference
     ) && provenance.is_none()
     {
         return Err(invalid_payload(
@@ -212,7 +225,7 @@ fn validate_payload_authority_source(
     object_type: ObjectType,
     payload: &serde_json::Map<String, Value>,
 ) -> Result<()> {
-    if !matches!(object_type, ObjectType::LogEntry | ObjectType::Preference) {
+    if !matches!(object_type, ObjectType::LogEntry | ObjectType::Setting) {
         return Ok(());
     }
 

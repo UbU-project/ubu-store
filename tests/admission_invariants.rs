@@ -10,6 +10,7 @@ use ubu_store::UbuStore;
 #[test]
 fn accepts_new_core_object_type_names() {
     for (name, expected) in [
+        ("Setting", ObjectType::Setting),
         ("Preference", ObjectType::Preference),
         ("Container", ObjectType::Container),
         ("UniverseState", ObjectType::UniverseState),
@@ -27,20 +28,20 @@ fn rejects_unknown_object_type_name() {
 }
 
 #[tokio::test]
-async fn admits_preference_with_canonical_envelope() {
+async fn admits_setting_with_canonical_envelope() {
     let store = UbuStore::in_memory().await.expect("store initializes");
-    let preference_id = UbuId::new(ObjectType::Preference).to_string();
+    let setting_id = UbuId::new(ObjectType::Setting).to_string();
 
     let admitted = common::admit_object(
         store.pool(),
         NewObjectRecord {
-            id: preference_id.clone(),
-            object_type: "Preference".to_owned(),
+            id: setting_id.clone(),
+            object_type: "Setting".to_owned(),
             version: 1,
             status: "active".to_owned(),
             compartment_label: "default".to_owned(),
             payload: json!({
-                "id": preference_id,
+                "id": setting_id,
                 "name": "calendar_density",
                 "value": "compact",
                 "authority_source": "user"
@@ -50,21 +51,21 @@ async fn admits_preference_with_canonical_envelope() {
         },
     )
     .await
-    .expect("preference admitted");
+    .expect("setting admitted");
 
-    assert_eq!(admitted.object_type, "Preference");
+    assert_eq!(admitted.object_type, "Setting");
 }
 
 #[tokio::test]
 async fn rejects_payload_without_canonical_id() {
     let store = UbuStore::in_memory().await.expect("store initializes");
-    let preference_id = UbuId::new(ObjectType::Preference).to_string();
+    let setting_id = UbuId::new(ObjectType::Setting).to_string();
 
     let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
-            id: preference_id,
-            object_type: "Preference".to_owned(),
+            id: setting_id,
+            object_type: "Setting".to_owned(),
             version: 1,
             status: "active".to_owned(),
             compartment_label: "default".to_owned(),
@@ -85,14 +86,14 @@ async fn rejects_payload_without_canonical_id() {
 #[tokio::test]
 async fn rejects_payload_id_that_does_not_match_record_id() {
     let store = UbuStore::in_memory().await.expect("store initializes");
-    let record_id = UbuId::new(ObjectType::Preference).to_string();
-    let payload_id = UbuId::new(ObjectType::Preference).to_string();
+    let record_id = UbuId::new(ObjectType::Setting).to_string();
+    let payload_id = UbuId::new(ObjectType::Setting).to_string();
 
     let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
             id: record_id,
-            object_type: "Preference".to_owned(),
+            object_type: "Setting".to_owned(),
             version: 1,
             status: "active".to_owned(),
             compartment_label: "default".to_owned(),
@@ -114,18 +115,18 @@ async fn rejects_payload_id_that_does_not_match_record_id() {
 #[tokio::test]
 async fn rejects_non_positive_object_version() {
     let store = UbuStore::in_memory().await.expect("store initializes");
-    let preference_id = UbuId::new(ObjectType::Preference).to_string();
+    let setting_id = UbuId::new(ObjectType::Setting).to_string();
 
     let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
-            id: preference_id.clone(),
-            object_type: "Preference".to_owned(),
+            id: setting_id.clone(),
+            object_type: "Setting".to_owned(),
             version: 0,
             status: "active".to_owned(),
             compartment_label: "default".to_owned(),
             payload: json!({
-                "id": preference_id,
+                "id": setting_id,
                 "name": "calendar_density",
                 "value": "compact",
                 "authority_source": "user"
@@ -170,20 +171,20 @@ async fn rejects_payload_provenance_without_authority_source() {
 }
 
 #[tokio::test]
-async fn rejects_preference_without_authority_source() {
+async fn rejects_setting_without_authority_source() {
     let store = UbuStore::in_memory().await.expect("store initializes");
-    let preference_id = UbuId::new(ObjectType::Preference).to_string();
+    let setting_id = UbuId::new(ObjectType::Setting).to_string();
 
     let result = common::admit_object(
         store.pool(),
         NewObjectRecord {
-            id: preference_id.clone(),
-            object_type: "Preference".to_owned(),
+            id: setting_id.clone(),
+            object_type: "Setting".to_owned(),
             version: 1,
             status: "active".to_owned(),
             compartment_label: "default".to_owned(),
             payload: json!({
-                "id": preference_id,
+                "id": setting_id,
                 "name": "calendar_density",
                 "value": "compact"
             }),

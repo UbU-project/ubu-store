@@ -143,3 +143,27 @@ async fn invalid_category_update_preserves_existing_task_and_ledger() {
     );
     assert_eq!(common::ledger(store.pool()).await, before);
 }
+
+#[tokio::test]
+async fn allowed_ranges_are_validated_piecemeal() {
+    let range =
+        json!({"earliest_start":"2026-09-21T10:00:00Z", "latest_finish":"2026-09-21T11:00:00Z"});
+    let store = UbuStore::in_memory().await.unwrap();
+    common::admit_object(store.pool(), record(json!({"allowed_time_range":range})))
+        .await
+        .unwrap();
+    for latest in ["2026-09-21T10:00:00Z", "2026-09-21T09:00:00Z"] {
+        let mut invalid = range.clone();
+        invalid["latest_finish"] = json!(latest);
+        assert!(matches!(
+            rejected(json!({"allowed_time_range":invalid})).await,
+            StoreError::Core(UbuError::InvalidTaskAllowedTimeRange)
+        ));
+    }
+    assert!(matches!(
+        rejected(json!({"allowed_time_range":range,
+        "static_window":{"start":"2026-09-21T10:00:00Z","end":"2026-09-21T11:00:00Z"}}))
+        .await,
+        StoreError::Core(UbuError::TaskStaticWithAllowedTimeRange)
+    ));
+}
