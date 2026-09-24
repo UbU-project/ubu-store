@@ -44,7 +44,7 @@ async fn routine_admission_checks_each_cross_field_without_rejecting_wrapper_fie
             2 => r.payload["priority"] = json!(1),
             _ => {
                 r.payload["routine_instance_template"]["after"] =
-                    json!([{"objective_id":r.id,"offset_seconds":0}])
+                    json!([{"objective_id":r.id,"minimum_seconds":0}])
             }
         }
         assert!(
