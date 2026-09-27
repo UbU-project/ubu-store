@@ -6,12 +6,21 @@
 
 Canonical objects must pass admission before insertion:
 
-All canonical writers require `&MutationEnvelope`: `admit_object`,
+Single-write canonical writers require `&MutationEnvelope`: `admit_object`,
 `persist_universe_state`, `append_log_entry`, and `store_external_reference`.
 They share envelope validation, Device-scoped replay detection, object-version
 preconditions, ledger recording, and transactional rollback. Logs and external
 references are append-only and need no target entry in `observed_versions`.
 UniverseState updates require an existing-version target precondition.
+
+`admit_batch(pool, Vec<BatchWrite>)` admits ordered Object and Log writes in one
+transaction. Each write carries its own envelope; later writes observe earlier
+ones. Any failure rolls back objects, Logs and mutation receipts together. An
+empty batch returns no results and writes nothing. Reusing a Device/key pair
+within one batch is an error, including an identical repeated payload. Replaying
+an already committed batch uses the ordinary per-write replay rules and returns
+current rows in request order without new writes. The batch owns commit/rollback;
+no connection or transaction type is added to the public admission API.
 
 The writer classification in `src/queries.rs` and the
 [canonical writer audit](docs/CANONICAL_WRITER_AUDIT.md) must be updated when adding

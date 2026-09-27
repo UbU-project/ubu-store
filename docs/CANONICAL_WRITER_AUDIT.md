@@ -14,6 +14,7 @@ are in `src/candidates.rs`; existing writers remain in `src/queries.rs`. All are
 re-exported by `api::admission`.
 
 ```rust
+pub async fn admit_batch(pool: &SqlitePool, writes: Vec<BatchWrite>) -> Result<Vec<BatchResult>>;
 pub async fn admit_object(pool: &SqlitePool, envelope: &MutationEnvelope, record: NewObjectRecord) -> Result<ObjectRecord>;
 pub async fn persist_universe_state(pool: &SqlitePool, envelope: &MutationEnvelope, state: &UniverseState, authority_source: AuthoritySource) -> Result<ObjectRecord>;
 pub async fn append_log_entry(pool: &SqlitePool, envelope: &MutationEnvelope, record: NewLogRecord) -> Result<LogRecord>;
@@ -51,7 +52,10 @@ rg -n 'SELECT|JOIN' src/queries.rs src/replay.rs src/recalculation.rs src/api
   failure anywhere explicitly rolls back every write, including the ledger.
 - `persist_universe_state` shares the same lower-level object writer. Logs and
   external references keep their existing envelope-required append paths.
-- All eight envelope-aware writers reuse `prepare_mutation`, `record_mutation`,
+- `admit_batch` composes prepared object and Log admissions in request order,
+  retaining per-write envelopes and owning commit/rollback of the entire batch.
+  It rejects repeated Device/key pairs before they can become within-batch replay.
+- All nine envelope-aware writers reuse `prepare_mutation`, `record_mutation`,
   and `finish_mutation`; precondition and replay logic is not copied.
 - All candidate changes occur in `advisory_candidates`. Every lifecycle change
   calls core's `transition` and writes an event via private `write_decision`.

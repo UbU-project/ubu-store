@@ -4,6 +4,7 @@
 //! | Writer | State category | Envelope and reason |
 //! | --- | --- | --- |
 //! | `admit_object` | admitted canonical | Required: creates/updates canonical objects. |
+//! | `admit_batch` | admitted canonical | Required per write: composes prepared object/Log writers in one transaction and owns commit or rollback for all of them. |
 //! | `persist_universe_state` | admitted canonical | Required: bumps a canonical object's version. |
 //! | `append_log_entry` | admitted canonical | Required: records an append-only fact. |
 //! | `store_external_reference` | admitted canonical | Required: `xref_` is a registry object type. |
@@ -354,51 +355,153 @@ pub async fn append_log_entry(
             MutationTarget::Log,
         )
         .await?;
-        if let Some(replay) = prepared.replay {
-            return sqlx::query_as::<_, LogRecord>("SELECT * FROM logs WHERE id = ?")
-                .bind(replay.result_object_id)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(Into::into);
-        }
-        validate_object_id_for_type(&record.id, ObjectType::LogEntry.as_str())?;
-        validate_provenance_json(&record.provenance)?;
-        if record.event_type == "recalculation_requested" {
-            validate_recalculation_trigger_payload(&record.payload)?;
-        }
-        UbuTimestamp::parse(&record.created_at)?;
-        let object_refs_json = serde_json::to_string(&record.object_refs)?;
-        let payload_json = serde_json::to_string(&record.payload)?;
-        let provenance_json = serde_json::to_string(&record.provenance)?;
+        append_prepared_log(&mut transaction, envelope, record, prepared).await
+    }
+    .await;
+    finish_mutation(transaction, result).await
+}
 
-        sqlx::query(
-            "INSERT INTO logs
-        (id, event_type, object_refs_json, payload_json, provenance_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&record.id)
-        .bind(&record.event_type)
-        .bind(&object_refs_json)
-        .bind(&payload_json)
-        .bind(&provenance_json)
-        .bind(&record.created_at)
-        .execute(&mut *transaction)
-        .await?;
-
-        record_mutation(
-            &mut transaction,
-            envelope,
-            &prepared.canonical_payload,
-            &record.id,
-            0,
-        )
-        .await?;
-
-        sqlx::query_as::<_, LogRecord>("SELECT * FROM logs WHERE id = ?")
-            .bind(&record.id)
-            .fetch_one(&mut *transaction)
+/// Complete Log admission on the transaction owned by the outer writer.
+pub(crate) async fn append_prepared_log(
+    connection: &mut SqliteConnection,
+    envelope: &MutationEnvelope,
+    record: NewLogRecord,
+    prepared: PreparedMutation,
+) -> Result<LogRecord> {
+    if let Some(replay) = prepared.replay {
+        return sqlx::query_as::<_, LogRecord>("SELECT * FROM logs WHERE id = ?")
+            .bind(replay.result_object_id)
+            .fetch_one(&mut *connection)
             .await
-            .map_err(Into::into)
+            .map_err(Into::into);
+    }
+    validate_object_id_for_type(&record.id, ObjectType::LogEntry.as_str())?;
+    validate_provenance_json(&record.provenance)?;
+    if record.event_type == "recalculation_requested" {
+        validate_recalculation_trigger_payload(&record.payload)?;
+    }
+    UbuTimestamp::parse(&record.created_at)?;
+    let object_refs_json = serde_json::to_string(&record.object_refs)?;
+    let payload_json = serde_json::to_string(&record.payload)?;
+    let provenance_json = serde_json::to_string(&record.provenance)?;
+
+    sqlx::query(
+        "INSERT INTO logs
+    (id, event_type, object_refs_json, payload_json, provenance_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&record.id)
+    .bind(&record.event_type)
+    .bind(&object_refs_json)
+    .bind(&payload_json)
+    .bind(&provenance_json)
+    .bind(&record.created_at)
+    .execute(&mut *connection)
+    .await?;
+
+    record_mutation(
+        connection,
+        envelope,
+        &prepared.canonical_payload,
+        &record.id,
+        0,
+    )
+    .await?;
+
+    sqlx::query_as::<_, LogRecord>("SELECT * FROM logs WHERE id = ?")
+        .bind(&record.id)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(Into::into)
+}
+
+/// One canonical write inside a batch. Each write carries its own envelope:
+/// the ledger is keyed by `(origin_device_id, idempotency_key)` and one key
+/// records exactly one result object.
+#[derive(Debug, Clone)]
+pub enum BatchWrite {
+    Object {
+        envelope: MutationEnvelope,
+        record: NewObjectRecord,
+    },
+    Log {
+        envelope: MutationEnvelope,
+        record: NewLogRecord,
+    },
+}
+
+/// The admitted result of one `BatchWrite`, in request order.
+#[derive(Debug, Clone)]
+pub enum BatchResult {
+    Object(ObjectRecord),
+    Log(LogRecord),
+}
+
+impl BatchResult {
+    pub fn as_object(&self) -> Option<&ObjectRecord> {
+        match self {
+            Self::Object(record) => Some(record),
+            Self::Log(_) => None,
+        }
+    }
+    pub fn as_log(&self) -> Option<&LogRecord> {
+        match self {
+            Self::Log(record) => Some(record),
+            Self::Object(_) => None,
+        }
+    }
+}
+
+/// Atomically admit ordered canonical writes. Later preconditions observe
+/// earlier writes. Replay retains the ordinary writers' current-state semantics.
+/// Only this outer writer owns commit or rollback; no transaction escapes it.
+pub async fn admit_batch(pool: &SqlitePool, writes: Vec<BatchWrite>) -> Result<Vec<BatchResult>> {
+    let mut transaction = crate::transactions::begin(pool).await?;
+    let result = async {
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::with_capacity(writes.len());
+        for write in writes {
+            let envelope = match &write {
+                BatchWrite::Object { envelope, .. } | BatchWrite::Log { envelope, .. } => envelope,
+            };
+            // prepare_mutation intentionally permits same-payload replay. Within
+            // one request, even identical repeated keys are a caller error.
+            if !seen.insert(envelope.mutation_key()) {
+                return Err(ubu_core::UbuError::IdempotencyKeyConflict {
+                    origin_device_id: envelope.origin_device_id.as_str().to_owned(),
+                    idempotency_key: envelope.idempotency_key.as_str().to_owned(),
+                }
+                .into());
+            }
+            results.push(match write {
+                BatchWrite::Object { envelope, record } => {
+                    let prepared = prepare_mutation(
+                        &mut transaction,
+                        &envelope,
+                        &record.payload,
+                        MutationTarget::Object,
+                    )
+                    .await?;
+                    BatchResult::Object(
+                        admit_prepared_object(&mut transaction, &envelope, record, prepared)
+                            .await?,
+                    )
+                }
+                BatchWrite::Log { envelope, record } => {
+                    let prepared = prepare_mutation(
+                        &mut transaction,
+                        &envelope,
+                        &record.payload,
+                        MutationTarget::Log,
+                    )
+                    .await?;
+                    BatchResult::Log(
+                        append_prepared_log(&mut transaction, &envelope, record, prepared).await?,
+                    )
+                }
+            });
+        }
+        Ok(results)
     }
     .await;
     finish_mutation(transaction, result).await
