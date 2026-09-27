@@ -114,6 +114,16 @@ were recorded during implementation:
 9. The store docs-only follow-up is published after the functional revision;
    the orchestrator intentionally pins the functional revision.
 
+The seven known limits required by the ticket are recorded verbatim:
+
+1. **No partial success.** A batch is all or nothing by design. A caller wanting best-effort behaviour must issue separate writes and handle the partial state itself.
+2. **No nested batches.** `admit_batch` opens a transaction; calling it from inside another writer is not supported and is not guarded against.
+3. **No candidate writes in a batch.** `admit_advisory_candidate` keeps its own writer. Composing a candidate decision into a batch would need the candidate lifecycle checks too, and nothing needs it yet.
+4. **Batch size is unbounded.** Nothing caps how many writes one transaction may hold. A decomposition is a handful; an import is not, and would need its own judgment.
+5. **The Container type is defined but unused.** `P1B-37` is the first thing that creates one. Nothing in this ticket plans, projects or displays a Container.
+6. **Split points are validated in `ubu-core`, not in JSON Schema.** The upper bound depends on `items`' length, which the schema cannot express.
+7. **Container `status` is not enforced by store admission.** Lifecycle-status validation in `ubu-store` covers Tasks only; the Container's status is enforced by its schema and by `Container::validate`.
+
 The approved generator fix preserves the document owner while resolving local
 references imported from another schema. Its two regression tests run offline
 before TypeScript generation, preventing nested Task references from resolving
