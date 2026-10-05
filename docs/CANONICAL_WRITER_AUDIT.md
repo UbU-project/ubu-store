@@ -130,3 +130,14 @@ rg -n 'SELECT|JOIN' src/queries.rs src/replay.rs src/recalculation.rs src/api
   generated timestamps and database shell metadata; its provenance.created_at and
   row.updated_at come from envelope.created_time and recorded_time. No Device
   registry checks, policy-version enforcement, matching, or payload purge is added.
+
+## Time-bounded review decisions
+
+`transition_advisory_candidate_with_context` and
+`reject_advisory_candidate_with_context` preserve the original writers and add
+optional caller-owned JSON decision context to the immutable mutation payload.
+The context participates in replay identity and commits atomically with the event.
+Context-aware rejection refreshes the current suppression record on a repeated
+key; every earlier rejection, reason and context remains in the mutation ledger.
+Calls without context retain the original insertion and replay behavior.
+The caller owns interval, expiry and escalation policy; the store owns atomicity.

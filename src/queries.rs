@@ -12,7 +12,7 @@
 //! | `store_projection_preview`, `store_projection_result` | `projection_state` | Exempt: projection artifacts, not canonical admission. |
 //! | `store_worker_submission` | noncanonical submission | Exempt: submissions require admission before becoming canonical, per CONTRACT.md. |
 //! | `store_advisory_candidate` | `candidate_state` | Required: provenance/idempotency for isolated proposal storage, never admission. |
-//! | `transition_advisory_candidate`, `reject_advisory_candidate` | `candidate_state` + review decisions | Required: Device-scoped replay and first-class decision provenance; no canonical object write. |
+//! | `transition_advisory_candidate`, `reject_advisory_candidate` (and their `_with_context` variants) | `candidate_state` + review decisions | Required: Device-scoped replay and first-class decision provenance; no canonical object write. |
 //! | `admit_advisory_candidate` | admitted canonical + review decision | Required: one transaction admits the ordinary object mutation and links its candidate decision. |
 //! | candidate decision events (private `write_decision`) | review events | Required: UBU-D0274 decision fields are the envelope fields; retry-safe decisions share the Device-global key. |
 //!

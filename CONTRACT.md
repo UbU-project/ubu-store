@@ -59,3 +59,14 @@ constraint preventing direct updates to `logs`.
 
 Phase 1 does not claim encrypted-at-rest storage or physical per-Compartment database isolation.
 Phase 2 may introduce separate SQLite files per Compartment and optional SQLite encryption.
+
+## Time-bounded review decisions
+
+`transition_advisory_candidate_with_context` and
+`reject_advisory_candidate_with_context` preserve the original writers and add
+optional caller-owned JSON decision context to the immutable mutation payload.
+The context participates in replay identity and commits atomically with the event.
+Context-aware rejection refreshes the current suppression record on a repeated
+key; every earlier rejection, reason and context remains in the mutation ledger.
+Calls without context retain the original insertion and replay behavior.
+The caller owns interval, expiry and escalation policy; the store owns atomicity.

@@ -1133,3 +1133,164 @@ async fn canonical_ledger_view_cannot_expose_candidate_request_payloads() {
     assert_eq!(replay.lifecycle_state, "proposed");
     assert_eq!(snapshot(store.pool()).await, before);
 }
+
+#[tokio::test]
+async fn renewed_rejection_preserves_history_and_selected_context_atomically() {
+    use ubu_store::candidates::reject_advisory_candidate_with_context as reject;
+    let (store, first, object) = setup().await;
+    let context = json!({"days": 3, "return_at": "2026-09-22T09:00:00Z"});
+    reject(
+        store.pool(),
+        &common::append_envelope(),
+        &first.advisory_candidate_id,
+        1,
+        rejection_input(),
+        Some(context.clone()),
+    )
+    .await
+    .unwrap();
+    let mut second = common::candidate_for(&object);
+    second.suppression_key = first.suppression_key.clone();
+    store_advisory_candidate(store.pool(), &common::append_envelope(), second.clone())
+        .await
+        .unwrap();
+    let env = common::append_envelope();
+    let mut input = rejection_input();
+    input.rejection_reason_or_user_correction = "A second considered correction.".into();
+    let before = snapshot(store.pool()).await;
+    assert!(reject(
+        store.pool(),
+        &env,
+        &second.advisory_candidate_id,
+        9,
+        input.clone(),
+        Some(context.clone())
+    )
+    .await
+    .is_err());
+    assert_eq!(snapshot(store.pool()).await, before);
+    let result = reject(
+        store.pool(),
+        &env,
+        &second.advisory_candidate_id,
+        1,
+        input.clone(),
+        Some(context.clone()),
+    )
+    .await
+    .unwrap();
+    let suppression =
+        find_suppression_record(store.pool(), first.suppression_key.as_ref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        suppression.rejection_reason_or_user_correction,
+        input.rejection_reason_or_user_correction
+    );
+    let saved = snapshot(store.pool()).await;
+    assert_eq!(
+        reject(
+            store.pool(),
+            &env,
+            &second.advisory_candidate_id,
+            1,
+            input.clone(),
+            Some(context)
+        )
+        .await
+        .unwrap(),
+        result
+    );
+    assert!(reject(
+        store.pool(),
+        &env,
+        &second.advisory_candidate_id,
+        1,
+        input,
+        Some(json!({"days": 4}))
+    )
+    .await
+    .is_err());
+    assert_eq!(snapshot(store.pool()).await, saved);
+    let payloads: Vec<String> = sqlx::query_scalar("SELECT canonical_payload FROM mutation_envelopes WHERE json_extract(canonical_payload, '$.operation') = 'reject_advisory_candidate'")
+        .fetch_all(store.pool()).await.unwrap();
+    assert_eq!(payloads.len(), 2);
+    for payload in payloads {
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap()["decision_context"]["days"],
+            3
+        );
+    }
+    assert_eq!(canonical_counts(store.pool()).await, vec![0; 9]);
+    let mut third = common::candidate_for(&object);
+    third.suppression_key = first.suppression_key;
+    store_advisory_candidate(store.pool(), &common::append_envelope(), third.clone())
+        .await
+        .unwrap();
+    common::fail_ledger_inserts(store.pool()).await;
+    let before = snapshot(store.pool()).await;
+    assert!(reject(
+        store.pool(),
+        &common::append_envelope(),
+        &third.advisory_candidate_id,
+        1,
+        rejection_input(),
+        Some(json!({"days": 7}))
+    )
+    .await
+    .is_err());
+    assert_eq!(snapshot(store.pool()).await, before);
+}
+
+#[tokio::test]
+async fn deferral_context_is_durable_and_part_of_replay_identity() {
+    use ubu_store::candidates::transition_advisory_candidate_with_context as decide;
+    let (store, candidate, _) = setup().await;
+    let env = common::append_envelope();
+    let context = Some(json!({"days": 2, "return_at": "2026-09-21T09:00:00Z"}));
+    let result = decide(
+        store.pool(),
+        &env,
+        &candidate.advisory_candidate_id,
+        1,
+        State::Deferred,
+        None,
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    let before = snapshot(store.pool()).await;
+    assert_eq!(
+        decide(
+            store.pool(),
+            &env,
+            &candidate.advisory_candidate_id,
+            1,
+            State::Deferred,
+            None,
+            context.clone()
+        )
+        .await
+        .unwrap(),
+        result
+    );
+    assert!(decide(
+        store.pool(),
+        &env,
+        &candidate.advisory_candidate_id,
+        1,
+        State::Deferred,
+        None,
+        Some(json!({"days": 1}))
+    )
+    .await
+    .is_err());
+    assert_eq!(snapshot(store.pool()).await, before);
+    let payload: String = sqlx::query_scalar("SELECT canonical_payload FROM mutation_envelopes WHERE json_extract(canonical_payload, '$.operation') = 'transition_advisory_candidate'")
+        .fetch_one(store.pool()).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&payload).unwrap()["decision_context"],
+        json!({"days": 2, "return_at": "2026-09-21T09:00:00Z"})
+    );
+}

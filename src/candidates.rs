@@ -183,10 +183,35 @@ pub async fn transition_advisory_candidate(
     next_state: CandidateLifecycleState,
     trigger: Option<ResurfaceTrigger>,
 ) -> Result<CandidateRecord> {
+    transition_advisory_candidate_with_context(
+        pool,
+        envelope,
+        id,
+        observed_version,
+        next_state,
+        trigger,
+        None,
+    )
+    .await
+}
+
+/// Persist optional caller-owned decision context in the immutable mutation ledger.
+pub async fn transition_advisory_candidate_with_context(
+    pool: &SqlitePool,
+    envelope: &MutationEnvelope,
+    id: &AdvisoryCandidateId,
+    observed_version: u64,
+    next_state: CandidateLifecycleState,
+    trigger: Option<ResurfaceTrigger>,
+    context: Option<serde_json::Value>,
+) -> Result<CandidateRecord> {
     let mut transaction = crate::transactions::begin(pool).await?;
     let result = async {
-        let payload = json!({"operation": "transition_advisory_candidate", "id": id,
+        let mut payload = json!({"operation": "transition_advisory_candidate", "id": id,
             "observed_version": observed_version, "next_state": next_state, "trigger": trigger});
+        if let Some(context) = &context {
+            payload["decision_context"] = context.clone();
+        }
         let prepared = prepare_mutation(
             &mut transaction,
             envelope,
@@ -246,10 +271,23 @@ pub async fn reject_advisory_candidate(
     observed_version: u64,
     input: RejectionInput,
 ) -> Result<CandidateRecord> {
+    reject_advisory_candidate_with_context(pool, envelope, id, observed_version, input, None).await
+}
+
+/// Persist optional caller-owned decision context in the immutable mutation ledger.
+pub async fn reject_advisory_candidate_with_context(
+    pool: &SqlitePool,
+    envelope: &MutationEnvelope,
+    id: &AdvisoryCandidateId,
+    observed_version: u64,
+    input: RejectionInput,
+    context: Option<serde_json::Value>,
+) -> Result<CandidateRecord> {
     let mut transaction = crate::transactions::begin(pool).await?;
     let result = async {
-        let payload = json!({"operation": "reject_advisory_candidate", "id": id,
+        let mut payload = json!({"operation": "reject_advisory_candidate", "id": id,
             "observed_version": observed_version, "input": input});
+        if let Some(context) = &context { payload["decision_context"] = context.clone(); }
         let prepared = prepare_mutation(&mut transaction, envelope, &payload, MutationTarget::Candidate).await?;
         if let Some(replay) = prepared.replay {
             return read_candidate(&mut transaction, &replay.result_object_id).await;
@@ -284,8 +322,13 @@ pub async fn reject_advisory_candidate(
             retention_policy: input.retention_policy,
             evidence_hashes_or_source_fingerprints: input.evidence_hashes_or_source_fingerprints,
         })?;
-        sqlx::query("INSERT INTO suppression_records (suppression_key, advisory_candidate_id, payload_json, decided_at)
-            VALUES (?, ?, ?, ?)")
+        // Context-aware callers explicitly renew a time-bounded dismissal. The
+        // immutable ledger retains each prior reason and decision context.
+        let insert = "INSERT INTO suppression_records (suppression_key, advisory_candidate_id, payload_json, decided_at) VALUES (?, ?, ?, ?)";
+        let statement = if context.is_some() {
+            format!("{insert} ON CONFLICT(suppression_key) DO UPDATE SET advisory_candidate_id=excluded.advisory_candidate_id, payload_json=excluded.payload_json, decided_at=excluded.decided_at")
+        } else { insert.to_owned() };
+        sqlx::query(&statement)
             .bind(&suppression.suppression_key).bind(id.as_str())
             .bind(serde_json::to_string(&suppression)?).bind(suppression.decided_at.to_string())
             .execute(&mut *transaction).await?;
